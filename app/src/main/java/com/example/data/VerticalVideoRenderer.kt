@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.PorterDuff
 import android.graphics.Rect
 import android.graphics.RectF
@@ -19,15 +20,21 @@ import android.text.TextPaint
 import android.util.Log
 import androidx.annotation.OptIn
 import androidx.core.content.res.ResourcesCompat
+import androidx.media3.common.C
 import androidx.media3.common.Effect
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
+import androidx.media3.common.audio.AudioProcessor
+import androidx.media3.common.audio.ChannelMixingAudioProcessor
+import androidx.media3.common.audio.ChannelMixingMatrix
+import androidx.media3.common.audio.SpeedProvider
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.effect.CanvasOverlay
 import androidx.media3.effect.OverlayEffect
 import androidx.media3.effect.Presentation
 import androidx.media3.transformer.Composition
 import androidx.media3.transformer.EditedMediaItem
+import androidx.media3.transformer.EditedMediaItemSequence
 import androidx.media3.transformer.Effects
 import androidx.media3.transformer.ExportException
 import androidx.media3.transformer.ExportResult
@@ -36,19 +43,29 @@ import androidx.media3.transformer.Transformer
 import com.example.R
 import com.example.model.CaptionSegment
 import com.example.model.CaptionStyle
+import com.example.model.TimeRangeSec
+import com.example.model.TransitionType
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import java.io.File
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+import kotlin.math.abs
+import kotlin.math.hypot
 import kotlin.math.max
-import kotlin.math.min
 import kotlin.math.roundToInt
 
 private const val TAG = "VerticalVideoRenderer"
 private const val OUT_WIDTH = 1080
 private const val OUT_HEIGHT = 1920
+
+data class MontageSegmentSpec(
+    val uri: Uri,
+    val startSec: Double,
+    val lengthSec: Double,
+    val hasAudio: Boolean = true
+)
 
 object VerticalVideoRenderer {
 
@@ -65,6 +82,7 @@ object VerticalVideoRenderer {
         captions: List<CaptionSegment>,
         enableHook: Boolean,
         hookText: String,
+        hookDurationSec: Double? = null,
         onProgress: (Float) -> Unit
     ): File = withContext(Dispatchers.IO) {
         if (outputFile.exists()) outputFile.delete()
@@ -76,9 +94,7 @@ object VerticalVideoRenderer {
         } else null
 
         val fgRect = computeCenteredVideoRect(sourceDims.width, sourceDims.height)
-        val typeface = runCatching {
-            ResourcesCompat.getFont(context, R.font.space_grotesk)
-        }.getOrNull() ?: Typeface.DEFAULT_BOLD
+        val typeface = loadHeadlineTypeface(context)
 
         val overlay = ViralClipCanvasOverlay(
             blurredBackground = blurredBg,
@@ -89,6 +105,9 @@ object VerticalVideoRenderer {
             captions = captions,
             enableHook = enableHook,
             hookText = hookText.trim(),
+            hookDurationSec = hookDurationSec,
+            transitionType = TransitionType.NONE,
+            cutTimestampsSec = emptyList(),
             headlineTypeface = typeface
         )
 
@@ -105,7 +124,193 @@ object VerticalVideoRenderer {
             )
             .build()
 
-        val presentation = if (verticalBlur) {
+        val presentation = createVerticalPresentation(verticalBlur)
+        val videoEffects = mutableListOf<Effect>(presentation)
+        if (verticalBlur || (enableHook && hookText.isNotBlank()) || (enableCaptions && captions.isNotEmpty())) {
+            videoEffects.add(OverlayEffect(listOf(overlay)))
+        }
+
+        val editedMediaItem = EditedMediaItem.Builder(mediaItem)
+            .setEffects(Effects(emptyList(), videoEffects))
+            .build()
+
+        runTransformerOnMainThread(context, editedMediaItem, null, outputFile, onProgress)
+        blurredBg?.recycle()
+        outputFile
+    }
+
+    /**
+     * Joins multiple trimmed video segments with optional speed, vertical 9:16 formatting,
+     * visual transitions, captions/karaoke/hook overlays, and looped background music.
+     */
+    @OptIn(UnstableApi::class)
+    suspend fun renderMontageJoin(
+        context: Context,
+        segments: List<MontageSegmentSpec>,
+        outputFile: File,
+        verticalBlur: Boolean,
+        speed: Float,
+        transitionType: TransitionType,
+        enableCaptions: Boolean,
+        captionStyle: CaptionStyle,
+        captions: List<CaptionSegment>,
+        enableHook: Boolean,
+        hookText: String,
+        hookDurationSec: Double?,
+        musicUri: Uri?,
+        musicVolume: Float,
+        onProgress: (Float) -> Unit
+    ): File = withContext(Dispatchers.IO) {
+        require(segments.isNotEmpty()) { "At least one segment is required." }
+        if (outputFile.exists()) outputFile.delete()
+        outputFile.parentFile?.mkdirs()
+
+        val firstSeg = segments.first()
+        val sourceDims = extractSourceVideoInfo(context, firstSeg.uri, firstSeg.startSec)
+        val blurredBg = if (verticalBlur) {
+            sourceDims.sampleFrame?.let { createVerticalBlurredBackground(it) }
+        } else null
+
+        val fgRect = computeCenteredVideoRect(sourceDims.width, sourceDims.height)
+        val typeface = loadHeadlineTypeface(context)
+
+        val safeSpeed = speed.coerceIn(0.5f, 2.0f)
+        val cutTimestamps = mutableListOf<Double>()
+        var runningSec = 0.0
+        for (i in 0 until segments.lastIndex) {
+            runningSec += segments[i].lengthSec / safeSpeed
+            cutTimestamps.add(runningSec)
+        }
+
+        val overlay = ViralClipCanvasOverlay(
+            blurredBackground = blurredBg,
+            foregroundVideoRect = fgRect,
+            verticalBlur = verticalBlur,
+            enableCaptions = enableCaptions,
+            captionStyle = captionStyle,
+            captions = captions,
+            enableHook = enableHook,
+            hookText = hookText.trim(),
+            hookDurationSec = hookDurationSec,
+            transitionType = transitionType,
+            cutTimestampsSec = cutTimestamps,
+            headlineTypeface = typeface
+        )
+
+        val presentation = createVerticalPresentation(verticalBlur)
+        val videoEffects = mutableListOf<Effect>(presentation)
+        if (verticalBlur ||
+            (enableHook && hookText.isNotBlank()) ||
+            (enableCaptions && captions.isNotEmpty()) ||
+            (transitionType != TransitionType.NONE && cutTimestamps.isNotEmpty())
+        ) {
+            videoEffects.add(OverlayEffect(listOf(overlay)))
+        }
+
+        val editedItems = segments.map { seg ->
+            val startMs = (seg.startSec * 1000.0).toLong().coerceAtLeast(0L)
+            val endMs = startMs + (seg.lengthSec * 1000.0).toLong().coerceAtLeast(300L)
+            val mediaItem = MediaItem.Builder()
+                .setUri(seg.uri)
+                .setClippingConfiguration(
+                    MediaItem.ClippingConfiguration.Builder()
+                        .setStartPositionMs(startMs)
+                        .setEndPositionMs(endMs)
+                        .build()
+                )
+                .build()
+
+            val itemAudioProcessors = mutableListOf<AudioProcessor>()
+            val itemVideoEffects = mutableListOf<Effect>(presentation)
+
+            if (abs(safeSpeed - 1.0f) > 0.02f) {
+                val speedPair = Effects.createExperimentalSpeedChangingEffect(
+                    object : SpeedProvider {
+                        override fun getSpeed(timeUs: Long): Float = safeSpeed
+                        override fun getNextSpeedChangeTimeUs(timeUs: Long): Long = C.TIME_UNSET
+                    }
+                )
+                itemAudioProcessors.add(speedPair.first)
+                itemVideoEffects.add(speedPair.second)
+            }
+
+            EditedMediaItem.Builder(mediaItem)
+                .setEffects(Effects(itemAudioProcessors, itemVideoEffects))
+                .build()
+        }
+
+        val mainSequence = EditedMediaItemSequence.Builder(editedItems).build()
+
+        val sequences = mutableListOf<EditedMediaItemSequence>(mainSequence)
+        if (musicUri != null && musicVolume > 0.01f) {
+            val vol = musicVolume.coerceIn(0f, 1f)
+            val volProcessor = ChannelMixingAudioProcessor().apply {
+                putChannelMixingMatrix(
+                    ChannelMixingMatrix(1, 2, floatArrayOf(vol, vol))
+                )
+                putChannelMixingMatrix(
+                    ChannelMixingMatrix(2, 2, floatArrayOf(vol, 0f, 0f, vol))
+                )
+            }
+            val musicItem = EditedMediaItem.Builder(MediaItem.fromUri(musicUri))
+                .setRemoveVideo(true)
+                .setEffects(Effects(listOf(volProcessor), emptyList()))
+                .build()
+            val musicSequence = EditedMediaItemSequence.Builder(listOf(musicItem))
+                .setIsLooping(true)
+                .build()
+            sequences.add(musicSequence)
+        }
+
+        val compositionBuilder = Composition.Builder(sequences)
+        if (videoEffects.size > 1) {
+            compositionBuilder.setEffects(Effects(emptyList(), listOf(videoEffects.last())))
+        }
+
+        runTransformerOnMainThread(context, null, compositionBuilder.build(), outputFile, onProgress)
+        blurredBg?.recycle()
+        outputFile
+    }
+
+    /**
+     * Renders jump-cut speech segments by trimming and concatenating non-silent intervals in Media3.
+     */
+    @OptIn(UnstableApi::class)
+    suspend fun renderJumpCutVideo(
+        context: Context,
+        inputUri: Uri,
+        keepIntervals: List<TimeRangeSec>,
+        outputFile: File,
+        onProgress: (Float) -> Unit
+    ): File = withContext(Dispatchers.IO) {
+        require(keepIntervals.isNotEmpty()) { "No non-silent intervals to export." }
+        if (outputFile.exists()) outputFile.delete()
+        outputFile.parentFile?.mkdirs()
+
+        val editedItems = keepIntervals.map { range ->
+            val startMs = (range.startSec * 1000.0).toLong().coerceAtLeast(0L)
+            val endMs = (range.endSec * 1000.0).toLong().coerceAtLeast(startMs + 100L)
+            val mediaItem = MediaItem.Builder()
+                .setUri(inputUri)
+                .setClippingConfiguration(
+                    MediaItem.ClippingConfiguration.Builder()
+                        .setStartPositionMs(startMs)
+                        .setEndPositionMs(endMs)
+                        .build()
+                )
+                .build()
+            EditedMediaItem.Builder(mediaItem).build()
+        }
+
+        val sequence = EditedMediaItemSequence.Builder(editedItems).build()
+        val composition = Composition.Builder(listOf(sequence)).build()
+        runTransformerOnMainThread(context, null, composition, outputFile, onProgress)
+        outputFile
+    }
+
+    @OptIn(UnstableApi::class)
+    private fun createVerticalPresentation(verticalBlur: Boolean): Presentation {
+        return if (verticalBlur) {
             Presentation.createForWidthAndHeight(
                 OUT_WIDTH,
                 OUT_HEIGHT,
@@ -118,25 +323,19 @@ object VerticalVideoRenderer {
                 Presentation.LAYOUT_SCALE_TO_FIT_WITH_CROP
             )
         }
+    }
 
-        val videoEffects = mutableListOf<Effect>(presentation)
-        if (verticalBlur || (enableHook && hookText.isNotBlank()) || (enableCaptions && captions.isNotEmpty())) {
-            videoEffects.add(OverlayEffect(listOf(overlay)))
-        }
-
-        val editedMediaItem = EditedMediaItem.Builder(mediaItem)
-            .setEffects(Effects(emptyList(), videoEffects))
-            .build()
-
-        runTransformerOnMainThread(context, editedMediaItem, outputFile, onProgress)
-        blurredBg?.recycle()
-        outputFile
+    private fun loadHeadlineTypeface(context: Context): Typeface {
+        return runCatching {
+            ResourcesCompat.getFont(context, R.font.space_grotesk)
+        }.getOrNull() ?: Typeface.DEFAULT_BOLD
     }
 
     @OptIn(UnstableApi::class)
     private suspend fun runTransformerOnMainThread(
         context: Context,
-        editedMediaItem: EditedMediaItem,
+        singleItem: EditedMediaItem?,
+        composition: Composition?,
         outputFile: File,
         onProgress: (Float) -> Unit
     ) = withContext(Dispatchers.Main) {
@@ -161,7 +360,7 @@ object VerticalVideoRenderer {
             }
 
             val listener = object : Transformer.Listener {
-                override fun onCompleted(composition: Composition, exportResult: ExportResult) {
+                override fun onCompleted(comp: Composition, exportResult: ExportResult) {
                     polling = false
                     handler.removeCallbacks(pollRunnable)
                     onProgress(1f)
@@ -169,7 +368,7 @@ object VerticalVideoRenderer {
                 }
 
                 override fun onError(
-                    composition: Composition,
+                    comp: Composition,
                     exportResult: ExportResult,
                     exportException: ExportException
                 ) {
@@ -192,7 +391,14 @@ object VerticalVideoRenderer {
                 runCatching { transformer.cancel() }
             }
 
-            transformer.start(editedMediaItem, outputFile.absolutePath)
+            if (composition != null) {
+                transformer.start(composition, outputFile.absolutePath)
+            } else if (singleItem != null) {
+                transformer.start(singleItem, outputFile.absolutePath)
+            } else {
+                continuation.resumeWithException(IllegalArgumentException("No media source specified."))
+                return@suspendCancellableCoroutine
+            }
             handler.postDelayed(pollRunnable, 250L)
         }
     }
@@ -245,10 +451,6 @@ object VerticalVideoRenderer {
         }
     }
 
-    /**
-     * Downscales + runs a fast multi-pass box blur + scales up with bilinear filtering
-     * to produce a smooth 1080x1920 vertical background frame compatible with all API 24+ devices.
-     */
     private fun createVerticalBlurredBackground(sourceFrame: Bitmap): Bitmap {
         val smallW = 108
         val smallH = 192
@@ -289,7 +491,6 @@ object VerticalVideoRenderer {
         val div = radius * 2 + 1
 
         repeat(2) {
-            // Horizontal pass
             for (y in 0 until h) {
                 val rowOff = y * w
                 for (x in 0 until w) {
@@ -306,7 +507,6 @@ object VerticalVideoRenderer {
                     tmp[rowOff + x] = (0xFF shl 24) or ((rSum / div) shl 16) or ((gSum / div) shl 8) or (bSum / div)
                 }
             }
-            // Vertical pass
             for (x in 0 until w) {
                 for (y in 0 until h) {
                     var rSum = 0
@@ -336,6 +536,9 @@ object VerticalVideoRenderer {
         private val captions: List<CaptionSegment>,
         private val enableHook: Boolean,
         private val hookText: String,
+        private val hookDurationSec: Double?,
+        private val transitionType: TransitionType,
+        private val cutTimestampsSec: List<Double>,
         headlineTypeface: Typeface
     ) : CanvasOverlay(/* useInputFrameSize = */ true) {
 
@@ -343,7 +546,6 @@ object VerticalVideoRenderer {
             color = Color.WHITE
             textSize = 60f
             typeface = Typeface.create(headlineTypeface, Typeface.BOLD)
-            textAlign = Paint.Align.LEFT
         }
 
         private val hookBoxPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -374,12 +576,33 @@ object VerticalVideoRenderer {
             setShadowLayer(8f, 0f, 6f, Color.argb(190, 0, 0, 0))
         }
 
+        private val karaokeWhitePaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            textSize = 72f
+            typeface = Typeface.create(headlineTypeface, Typeface.BOLD)
+            style = Paint.Style.FILL
+            setShadowLayer(8f, 0f, 6f, Color.argb(190, 0, 0, 0))
+        }
+
+        private val karaokeYellowPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.rgb(250, 204, 21)
+            textSize = 76f
+            typeface = Typeface.create(headlineTypeface, Typeface.BOLD)
+            style = Paint.Style.FILL
+            setShadowLayer(10f, 0f, 6f, Color.argb(210, 0, 0, 0))
+        }
+
+        private val transitionPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+        }
+
         override fun onDraw(canvas: Canvas, presentationTimeUs: Long) {
             canvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
             val w = canvas.width
             val h = canvas.height
+            val currentSec = presentationTimeUs / 1_000_000.0
 
-            // 1. Blurred letterbox/pillarbox regions (leaving centered video window completely transparent)
+            // 1. Blurred letterbox/pillarbox regions
             if (verticalBlur && blurredBackground != null) {
                 if (foregroundVideoRect.top > 0) {
                     val topSrc = Rect(0, 0, OUT_WIDTH, foregroundVideoRect.top)
@@ -393,8 +616,14 @@ object VerticalVideoRenderer {
                 }
             }
 
-            // 2. Top Hook Header Pill
-            if (enableHook && hookText.isNotBlank()) {
+            // 2. Cut transition effects
+            if (transitionType != TransitionType.NONE && cutTimestampsSec.isNotEmpty()) {
+                drawTransitionAtCuts(canvas, w, h, currentSec)
+            }
+
+            // 3. Top Hook Header Pill (optionally timed to hookDurationSec)
+            val hookVisible = hookDurationSec == null || currentSec <= hookDurationSec
+            if (enableHook && hookText.isNotBlank() && hookVisible) {
                 val maxTextWidth = (w * 0.82f).roundToInt()
                 val layout = StaticLayout.Builder.obtain(
                     hookText.uppercase(),
@@ -425,41 +654,100 @@ object VerticalVideoRenderer {
                 canvas.restore()
             }
 
-            // 3. Dynamic Synced Auto-Captions
+            // 4. Dynamic Synced Auto-Captions / Karaoke
             if (enableCaptions && captions.isNotEmpty()) {
-                val currentSec = presentationTimeUs / 1_000_000.0
                 val active = captions.firstOrNull { currentSec in it.startSec..it.endSec }
                 if (active != null) {
-                    val maxWidth = (w * 0.86f).roundToInt()
-                    val strokeLayout = StaticLayout.Builder.obtain(
-                        active.text,
-                        0,
-                        active.text.length,
-                        captionStrokePaint,
-                        maxWidth
-                    )
-                        .setAlignment(Layout.Alignment.ALIGN_CENTER)
-                        .setLineSpacing(6f, 1f)
-                        .build()
-
-                    val fillLayout = StaticLayout.Builder.obtain(
-                        active.text,
-                        0,
-                        active.text.length,
-                        captionFillPaint,
-                        maxWidth
-                    )
-                        .setAlignment(Layout.Alignment.ALIGN_CENTER)
-                        .setLineSpacing(6f, 1f)
-                        .build()
-
-                    val yPos = h * 0.75f - strokeLayout.height / 2f
-                    canvas.save()
-                    canvas.translate((w - maxWidth) / 2f, yPos)
-                    strokeLayout.draw(canvas)
-                    fillLayout.draw(canvas)
-                    canvas.restore()
+                    if (captionStyle == CaptionStyle.KARAOKE && active.words.isNotEmpty()) {
+                        drawKaraokeLine(canvas, w, h, active, currentSec)
+                    } else {
+                        drawStandardCaption(canvas, w, h, active.text)
+                    }
                 }
+            }
+        }
+
+        private fun drawStandardCaption(canvas: Canvas, w: Int, h: Int, text: String) {
+            val maxWidth = (w * 0.86f).roundToInt()
+            val strokeLayout = StaticLayout.Builder.obtain(
+                text, 0, text.length, captionStrokePaint, maxWidth
+            ).setAlignment(Layout.Alignment.ALIGN_CENTER).setLineSpacing(6f, 1f).build()
+
+            val fillLayout = StaticLayout.Builder.obtain(
+                text, 0, text.length, captionFillPaint, maxWidth
+            ).setAlignment(Layout.Alignment.ALIGN_CENTER).setLineSpacing(6f, 1f).build()
+
+            val yPos = h * 0.75f - strokeLayout.height / 2f
+            canvas.save()
+            canvas.translate((w - maxWidth) / 2f, yPos)
+            strokeLayout.draw(canvas)
+            fillLayout.draw(canvas)
+            canvas.restore()
+        }
+
+        private fun drawKaraokeLine(
+            canvas: Canvas,
+            w: Int,
+            h: Int,
+            segment: CaptionSegment,
+            currentSec: Double
+        ) {
+            val words = segment.words.take(4)
+            if (words.isEmpty()) {
+                drawStandardCaption(canvas, w, h, segment.text)
+                return
+            }
+            val spaceW = karaokeWhitePaint.measureText(" ")
+            val totalW = words.sumOf { karaokeWhitePaint.measureText(it.word).toDouble() }.toFloat() +
+                spaceW * (words.size - 1)
+            var cursorX = (w - totalW) / 2f
+            val yPos = h * 0.75f
+
+            words.forEachIndexed { idx, word ->
+                val isCurrent = currentSec >= word.startSec &&
+                    (currentSec <= word.endSec || idx == words.lastIndex)
+                val fillPaint = if (isCurrent) karaokeYellowPaint else karaokeWhitePaint
+                canvas.drawText(word.word, cursorX, yPos, captionStrokePaint)
+                canvas.drawText(word.word, cursorX, yPos, fillPaint)
+                cursorX += karaokeWhitePaint.measureText(word.word) + spaceW
+            }
+        }
+
+        private fun drawTransitionAtCuts(canvas: Canvas, w: Int, h: Int, currentSec: Double) {
+            val halfWindow = 0.25
+            val cut = cutTimestampsSec.firstOrNull { abs(currentSec - it) <= halfWindow } ?: return
+            val dist = abs(currentSec - cut) / halfWindow // 0 at exact cut, 1 at edge
+            val intensity = (1.0 - dist).toFloat().coerceIn(0f, 1f)
+
+            when (transitionType) {
+                TransitionType.FADE, TransitionType.DISSOLVE -> {
+                    val alpha = (intensity * 235).roundToInt().coerceIn(0, 255)
+                    transitionPaint.color = Color.argb(alpha, 10, 8, 20)
+                    canvas.drawRect(0f, 0f, w.toFloat(), h.toFloat(), transitionPaint)
+                }
+                TransitionType.SLIDE -> {
+                    val progress = ((currentSec - (cut - halfWindow)) / (halfWindow * 2.0)).toFloat().coerceIn(0f, 1f)
+                    val barW = w * 0.45f
+                    val left = -barW + progress * (w + barW)
+                    transitionPaint.color = Color.argb(230, 139, 92, 246)
+                    canvas.drawRect(left, 0f, left + barW, h.toFloat(), transitionPaint)
+                }
+                TransitionType.WIPE -> {
+                    val wipeW = w * intensity
+                    transitionPaint.color = Color.argb(220, 10, 8, 20)
+                    canvas.drawRect(0f, 0f, wipeW, h.toFloat(), transitionPaint)
+                }
+                TransitionType.CIRCLE -> {
+                    val maxR = hypot(w / 2f, h / 2f)
+                    val holeR = maxR * (1f - intensity)
+                    val path = Path().apply {
+                        addRect(0f, 0f, w.toFloat(), h.toFloat(), Path.Direction.CW)
+                        addCircle(w / 2f, h / 2f, holeR, Path.Direction.CCW)
+                    }
+                    transitionPaint.color = Color.argb(240, 10, 8, 20)
+                    canvas.drawPath(path, transitionPaint)
+                }
+                TransitionType.NONE -> Unit
             }
         }
     }

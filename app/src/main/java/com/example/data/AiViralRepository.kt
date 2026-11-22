@@ -4,6 +4,7 @@ import android.graphics.Bitmap
 import android.util.Base64
 import android.util.Log
 import com.example.model.CaptionSegment
+import com.example.model.CaptionWord
 import com.example.model.LiveChatMessage
 import com.example.model.ViralAnalysisResult
 import kotlinx.coroutines.CancellationException
@@ -66,7 +67,8 @@ class AiViralRepository {
         keyframes: List<Bitmap>,
         videoTitle: String,
         durationSec: Int,
-        generateCaptions: Boolean
+        generateCaptions: Boolean,
+        karaokeMode: Boolean = false
     ): ViralAnalysisResult {
         val key = requireApiKey(apiKey)
         val model = modelName.trim().ifBlank { GeminiSettings.DEFAULT_GEMINI_MODEL }
@@ -94,13 +96,14 @@ class AiViralRepository {
                 append("Analyze the attached ")
                 if (audioBytes != null) append("audio track ") else append("video keyframes ")
                 append("for a $durationSec-second clip titled \"$videoTitle\". ")
-                append("1) Create a bold, scroll-stopping uppercase hook headline (2-5 words, e.g. 'WAIT FOR THIS MOMENT!'). ")
+                append("1) Create a bold, scroll-stopping uppercase hook headline (3-7 words, e.g. 'WAIT FOR THIS INSANE MOMENT!'). Prefer punchy spoken questions or exclamations if speech exists. ")
                 append("2) Rate its viral energy from 1 to 100 and briefly explain why. ")
                 if (generateCaptions) {
+                    val wordsPerChunk = if (karaokeMode) "exactly 3 words" else "2 to 4 words"
                     if (audioBytes != null) {
-                        append("3) Transcribe the spoken audio accurately into dynamic short-form caption chunks of 2 to 4 words each with precise startSec and endSec timestamps between 0.0 and $durationSec.0. If speech is sparse or music-only, describe key audio/visual beats cleanly.")
+                        append("3) Transcribe the spoken audio accurately into dynamic short-form caption chunks of $wordsPerChunk each with precise startSec, endSec, and per-word timestamps in 'words' between 0.0 and $durationSec.0.")
                     } else {
-                        append("3) Generate 4 to 6 punchy visual caption beats timed evenly across 0.0 to $durationSec.0 seconds describing the on-screen action.")
+                        append("3) Generate 4 to 6 punchy visual caption beats of $wordsPerChunk timed evenly across 0.0 to $durationSec.0 seconds with per-word timestamps.")
                     }
                 } else {
                     append("3) Return an empty captions array [].")
@@ -113,7 +116,7 @@ class AiViralRepository {
             put("properties", JSONObject().apply {
                 put("suggestedHook", JSONObject().apply {
                     put("type", "STRING")
-                    put("description", "Short punchy uppercase viral hook title of 2 to 5 words")
+                    put("description", "Short punchy uppercase viral hook title")
                 })
                 put("viralScore", JSONObject().apply {
                     put("type", "INTEGER")
@@ -125,13 +128,24 @@ class AiViralRepository {
                 })
                 put("captions", JSONObject().apply {
                     put("type", "ARRAY")
-                    put("description", "Timed word-chunk captions in 2 to 4 word phrases matching the clip timeline")
                     put("items", JSONObject().apply {
                         put("type", "OBJECT")
                         put("properties", JSONObject().apply {
                             put("startSec", JSONObject().put("type", "NUMBER"))
                             put("endSec", JSONObject().put("type", "NUMBER"))
                             put("text", JSONObject().put("type", "STRING"))
+                            put("words", JSONObject().apply {
+                                put("type", "ARRAY")
+                                put("items", JSONObject().apply {
+                                    put("type", "OBJECT")
+                                    put("properties", JSONObject().apply {
+                                        put("startSec", JSONObject().put("type", "NUMBER"))
+                                        put("endSec", JSONObject().put("type", "NUMBER"))
+                                        put("word", JSONObject().put("type", "STRING"))
+                                    })
+                                    put("required", JSONArray(listOf("startSec", "endSec", "word")))
+                                })
+                            })
                         })
                         put("required", JSONArray(listOf("startSec", "endSec", "text")))
                     })
@@ -163,9 +177,48 @@ class AiViralRepository {
                     val end = obj.optDouble("endSec", start + 1.5)
                         .coerceIn(start + 0.25, durationSec.toDouble())
                     val text = obj.optString("text", "").trim().uppercase()
-                    if (text.isNotEmpty()) {
-                        add(CaptionSegment(startSec = start, endSec = end, text = text))
+                    if (text.isEmpty()) continue
+
+                    val wordsJson = obj.optJSONArray("words")
+                    val parsedWords = buildList {
+                        if (wordsJson != null && wordsJson.length() > 0) {
+                            for (w in 0 until wordsJson.length()) {
+                                val wo = wordsJson.optJSONObject(w) ?: continue
+                                val wText = wo.optString("word", "").trim().uppercase()
+                                if (wText.isEmpty()) continue
+                                val wStart = wo.optDouble("startSec", start).coerceIn(start, end)
+                                val wEnd = wo.optDouble("endSec", wStart + 0.25).coerceIn(wStart + 0.05, end)
+                                add(CaptionWord(wStart, wEnd, wText))
+                            }
+                        }
                     }
+
+                    // Ensure Karaoke always has word timings even if model omitted 'words'
+                    val finalWords = if (parsedWords.isNotEmpty()) {
+                        parsedWords
+                    } else {
+                        val tokens = text.split(Regex("\\s+")).filter { it.isNotBlank() }
+                        if (tokens.isEmpty()) emptyList()
+                        else {
+                            val step = (end - start) / tokens.size
+                            tokens.mapIndexed { idx, tok ->
+                                CaptionWord(
+                                    startSec = start + idx * step,
+                                    endSec = start + (idx + 1) * step,
+                                    word = tok
+                                )
+                            }
+                        }
+                    }
+
+                    add(
+                        CaptionSegment(
+                            startSec = start,
+                            endSec = end,
+                            text = text,
+                            words = finalWords
+                        )
+                    )
                 }
             }
         }
@@ -188,7 +241,7 @@ class AiViralRepository {
         val model = modelName.trim().ifBlank { GeminiSettings.DEFAULT_GEMINI_MODEL }
 
         val prompt = "Generate ONE ultra-punchy uppercase viral short-form video hook header " +
-            "(2 to 5 words max, no quotes, no hashtags) for a video titled \"$videoTitle\". " +
+            "(2 to 6 words max, no quotes, no hashtags) for a video titled \"$videoTitle\". " +
             if (extraContext.isNotBlank()) "Context: $extraContext" else ""
 
         val payload = JSONObject().apply {
@@ -198,7 +251,7 @@ class AiViralRepository {
         }
 
         val text = callGeminiRest(key, model, payload, timeoutMs = 30_000L)
-        return text.trim().replace("\"", "").uppercase().take(48)
+        return text.trim().replace("\"", "").uppercase().take(52)
             .ifBlank { "WAIT FOR IT!" }
     }
 

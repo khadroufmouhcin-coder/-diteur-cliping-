@@ -1,0 +1,814 @@
+# ============================================================
+#  AI Viral Clipper v2 (DIGICLIPS-style) - ready for Colab
+#  Tabs: Normal Video | Live Stream | Montage | AI Auto-Montage | Silence Remover
+#  Cell 1 (run first):
+#      !pip -q install -U yt-dlp faster-whisper pytchat gradio numpy
+#      !apt -qq install ffmpeg -y
+#  Cell 2: paste this whole file, run it, open the gradio.live link
+# ============================================================
+import glob
+import math
+import os
+import re
+import shutil
+import subprocess
+import time
+import uuid
+import wave
+from collections import deque
+
+import gradio as gr
+import numpy as np
+import pytchat
+import yt_dlp
+from faster_whisper import WhisperModel
+
+OUTPUT_DIR = "viral_clips_output"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+CAPTION_STYLES = ["Viral Yellow", "Neon Cyan", "Modern Clean", "Karaoke"]
+TRANSITIONS = {
+    "None": None, "Fade": "fade", "Slide": "slideleft",
+    "Wipe": "wipeleft", "Circle": "circleopen", "Dissolve": "dissolve",
+}
+
+print("Loading Whisper model...")
+whisper_model = WhisperModel("base", device="auto", compute_type="int8")
+
+
+# ---------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------
+def extract_video_id(url: str) -> str:
+    patterns = [
+        r"youtu\.be/([0-9A-Za-z_-]{11})",
+        r"live/([0-9A-Za-z_-]{11})",
+        r"shorts/([0-9A-Za-z_-]{11})",
+        r"v=([0-9A-Za-z_-]{11})",
+    ]
+    for p in patterns:
+        m = re.search(p, url)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def get_duration(path: str) -> float:
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=nw=1:nk=1", path],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    try:
+        return float(out)
+    except ValueError:
+        return 30.0
+
+
+def download_youtube_video(url: str, output_path: str, cookies=None) -> str:
+    opts = {
+        "format": "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "outtmpl": output_path,
+        "merge_output_format": "mp4",
+        "quiet": True,
+        "no_warnings": True,
+    }
+    if cookies:
+        opts["cookiefile"] = cookies
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.download([url])
+    return output_path
+
+
+def find_viral_peak_timestamp(video_path: str, clip_duration: int) -> float:
+    """Loudest window (RMS); start 5 seconds before the peak"""
+    if not has_audio(video_path):
+        return 0.0
+    wav = f"{video_path}_temp.wav"
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", video_path, "-ac", "1", "-ar", "16000", wav],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True,
+    )
+    with wave.open(wav, "rb") as wf:
+        sr = wf.getframerate()
+        data = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).astype(np.float32)
+    os.remove(wav)
+
+    total = len(data) / sr
+    if total <= clip_duration:
+        return 0.0
+
+    energies = np.array([
+        np.sqrt(np.mean(data[s * sr:(s + 1) * sr] ** 2)) if len(data[s * sr:(s + 1) * sr]) else 0
+        for s in range(int(total))
+    ])
+    best_start, best = 0, -1.0
+    for s in range(0, max(1, len(energies) - clip_duration)):
+        e = float(np.mean(energies[s:s + clip_duration]))
+        if e > best:
+            best, best_start = e, s
+    return float(max(0, best_start - 5))
+
+
+def format_ass_time(seconds: float) -> str:
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    cs = int((seconds - int(seconds)) * 100)
+    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+
+def karaoke_events(words, per_line=3):
+    """Show 3 words at a time and highlight the word being spoken."""
+    ev = []
+    for i in range(0, len(words), per_line):
+        chunk = words[i:i + per_line]
+        texts = [w.word.strip().upper() for w in chunk]
+        for j, w in enumerate(chunk):
+            end = chunk[j + 1].start if j + 1 < len(chunk) else w.end
+            parts = []
+            for k, t in enumerate(texts):
+                if k == j:
+                    parts.append("{\\c&H0000FFFF&}" + t + "{\\c&H00FFFFFF&}")
+                else:
+                    parts.append(t)
+            ev.append("Dialogue: 0," + format_ass_time(w.start) + "," + format_ass_time(max(end, w.start + 0.05))
+                      + ",CaptionStyle,,0,0,0,," + " ".join(parts))
+    return ev
+
+
+def generate_ass_subtitles(clip_path, ass_path, clip_duration,
+                           enable_captions, caption_style, enable_hook, hook_text,
+                           segments=None, hook_seconds=None):
+    colors = {
+        "Viral Yellow": "&H0000FFFF",
+        "Neon Cyan": "&H00FFFF00",
+        "Modern Clean": "&H00FFFFFF",
+        "Karaoke": "&H00FFFFFF",
+    }
+    karaoke = caption_style == "Karaoke"
+    primary = colors.get(caption_style, "&H0000FFFF")
+
+    header = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: CaptionStyle,Arial,68,{primary},&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,5,2,2,60,60,340,1
+Style: HookStyle,Arial,64,&H00FFFFFF,&H000000FF,&H00000000,&HCC000000,-1,0,0,0,100,100,0,0,3,18,0,8,70,70,220,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+    events = []
+    if enable_hook and (hook_text or "").strip():
+        h = hook_text.strip().upper().replace("\n", "\\N")
+        hook_end = min(clip_duration, hook_seconds) if hook_seconds else clip_duration
+        events.append(f"Dialogue: 1,0:00:00.00,{format_ass_time(hook_end)},HookStyle,,0,0,0,,{h}")
+
+    if enable_captions:
+        if segments is None:
+            segments, _ = whisper_model.transcribe(clip_path, word_timestamps=True)
+        for seg in segments:
+            words = seg.words or []
+            if words and karaoke:
+                events.extend(karaoke_events(words))
+            elif words:
+                for i in range(0, len(words), 4):
+                    chunk = words[i:i + 4]
+                    phrase = " ".join(w.word.strip() for w in chunk).upper()
+                    events.append(
+                        f"Dialogue: 0,{format_ass_time(chunk[0].start)},"
+                        f"{format_ass_time(chunk[-1].end)},CaptionStyle,,0,0,0,,{phrase}")
+            else:
+                events.append(
+                    f"Dialogue: 0,{format_ass_time(seg.start)},{format_ass_time(seg.end)},"
+                    f"CaptionStyle,,0,0,0,,{seg.text.strip().upper()}")
+
+    with open(ass_path, "w", encoding="utf-8") as f:
+        f.write(header + "\n".join(events))
+
+
+def render_vertical_short(raw_clip, final_out, ass_path, vertical_blur=True):
+    ass = ass_path.replace("\\", "/").replace(":", "\\:")
+    if vertical_blur:
+        fc = ("[0:v]scale=1080:1920:force_original_aspect_ratio=increase,"
+              "crop=1080:1920,boxblur=25:10[bg];"
+              "[0:v]scale=1080:-2[fg];"
+              f"[bg][fg]overlay=(W-w)/2:(H-h)/2,subtitles='{ass}'[outv]")
+    else:
+        fc = ("[0:v]scale=1080:1920:force_original_aspect_ratio=increase,"
+              f"crop=1080:1920,subtitles='{ass}'[outv]")
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", raw_clip, "-filter_complex", fc,
+         "-map", "[outv]", "-map", "0:a?",
+         "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+         "-c:a", "aac", "-b:a", "128k", final_out],
+        check=True,
+    )
+
+
+# ---------------------------------------------------------------
+# Hype meter
+# ---------------------------------------------------------------
+def hype_html(count: int, threshold: int) -> str:
+    ratio = count / max(1, threshold)
+    pct = min(100, int(ratio * 100))
+    if ratio >= 1:
+        label, color = "PEAK VIRAL HYPE 🔥", "#f97316"
+    elif ratio >= 0.7:
+        label, color = "VERY HIGH VELOCITY", "#ef4444"
+    elif ratio >= 0.35:
+        label, color = "BUILDING MOMENTUM", "#8b5cf6"
+    else:
+        label, color = "CALM", "#9ca3af"
+    return f"""
+    <div style="padding:10px;border-radius:12px;border:1px solid #ddd">
+      <div style="display:flex;justify-content:space-between;font-weight:700">
+        <span>🔥 Chat Hype Level</span><span style="color:{color}">{label}</span>
+      </div>
+      <div style="background:#eee;border-radius:8px;height:14px;margin-top:8px;overflow:hidden">
+        <div style="width:{pct}%;height:100%;background:{color}"></div>
+      </div>
+      <div style="font-size:12px;margin-top:6px;opacity:.7">
+        {pct}% hype • {count} comments in last 30s (threshold {threshold})
+      </div>
+    </div>"""
+
+
+# ---------------------------------------------------------------
+# 1) Normal video
+# ---------------------------------------------------------------
+def process_normal_video(url, upload, cookies, duration_choice, vertical_blur,
+                         enable_captions, caption_style, enable_hook, hook_text):
+    if not (url or "").strip() and not upload:
+        return None, "Paste a YouTube link or upload a video."
+
+    duration = int(duration_choice.replace("s", ""))
+    job = uuid.uuid4().hex[:8]
+    full = os.path.join(OUTPUT_DIR, f"full_{job}.mp4")
+    raw = os.path.join(OUTPUT_DIR, f"raw_{job}.mp4")
+    ass = os.path.join(OUTPUT_DIR, f"subs_{job}.ass")
+    final = os.path.join(OUTPUT_DIR, f"viral_{job}.mp4")
+    try:
+        if upload:
+            shutil.copy(upload, full)
+        else:
+            download_youtube_video(url, full, cookies)
+        start = find_viral_peak_timestamp(full, duration)
+        subprocess.run(
+            ["ffmpeg", "-y", "-ss", str(start), "-i", full, "-t", str(duration),
+             "-c:v", "libx264", "-c:a", "aac", raw], check=True)
+        generate_ass_subtitles(raw, ass, duration, enable_captions,
+                               caption_style, enable_hook, hook_text)
+        render_vertical_short(raw, final, ass, vertical_blur)
+        return final, f"Done! Clip starts at second {int(start)}"
+    except Exception as e:
+        return None, f"Error: {e}"
+    finally:
+        for t in (full, raw, ass):
+            if os.path.exists(t):
+                os.remove(t)
+
+
+# ---------------------------------------------------------------
+# 2) Live: rolling recording + chat watch + cut last seconds
+# ---------------------------------------------------------------
+def get_stream_url(url: str, cookies=None) -> str:
+    o = {"quiet": True, "no_warnings": True, "format": "best[height<=720]/best"}
+    if cookies:
+        o["cookiefile"] = cookies
+    with yt_dlp.YoutubeDL(o) as ydl:
+        info = ydl.extract_info(url, download=False)
+    return info["url"]
+
+
+def monitor_live_stream(url, cookies, duration_choice, threshold, max_wait,
+                        vertical_blur, enable_captions, caption_style,
+                        enable_hook, hook_text):
+    vid = extract_video_id(url)
+    if not vid:
+        yield None, "Invalid live link.", hype_html(0, threshold)
+        return
+
+    duration = int(duration_choice.replace("s", ""))
+    job = uuid.uuid4().hex[:8]
+    rec_dir = os.path.join(OUTPUT_DIR, f"rec_{job}")
+    os.makedirs(rec_dir, exist_ok=True)
+    recorder = None
+
+    try:
+        yield None, "Connecting to the stream...", hype_html(0, threshold)
+        stream_url = get_stream_url(url, cookies)
+
+        # Rolling recording in 5s segments
+        recorder = subprocess.Popen(
+            ["ffmpeg", "-loglevel", "error", "-i", stream_url, "-c", "copy",
+             "-f", "segment", "-segment_time", "5", "-reset_timestamps", "1",
+             "-segment_format", "mpegts", os.path.join(rec_dir, "seg_%05d.ts")],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        chat = pytchat.create(video_id=vid)
+        stamps = deque()
+        t0 = time.time()
+        hyped, count = False, 0
+
+        while chat.is_alive() and time.time() - t0 < max_wait:
+            for _ in chat.get().sync_items():
+                stamps.append(time.time())
+            now = time.time()
+            while stamps and now - stamps[0] > 30:
+                stamps.popleft()
+            count = len(stamps)
+
+            # Keep only the last 40 segments (~200s)
+            segs = sorted(glob.glob(os.path.join(rec_dir, "seg_*.ts")))
+            for old in segs[:-40]:
+                os.remove(old)
+
+            yield None, f"Watching chat... ({int(now - t0)}s)", hype_html(count, threshold)
+            if count >= threshold:
+                hyped = True
+                break
+            time.sleep(2)
+
+        if not hyped:
+            yield None, f"Monitoring time over ({max_wait}s) with no spike.", hype_html(count, threshold)
+            return
+
+        yield None, "VIRAL MOMENT DETECTED! Cutting the clip...", hype_html(count, threshold)
+        time.sleep(3)
+        recorder.terminate()
+        recorder.wait(timeout=10)
+
+        segs = sorted(glob.glob(os.path.join(rec_dir, "seg_*.ts")))
+        need = max(2, math.ceil(duration / 5))
+        chosen = segs[-need:]
+        if not chosen:
+            yield None, "Nothing was recorded from the stream.", hype_html(count, threshold)
+            return
+
+        lst = os.path.join(rec_dir, "list.txt")
+        with open(lst, "w") as f:
+            for s in chosen:
+                f.write(f"file '{os.path.abspath(s)}'\n")
+        raw = os.path.join(OUTPUT_DIR, f"live_raw_{job}.mp4")
+        ass = os.path.join(OUTPUT_DIR, f"live_subs_{job}.ass")
+        final = os.path.join(OUTPUT_DIR, f"live_viral_{job}.mp4")
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
+             "-i", lst, "-c:v", "libx264", "-c:a", "aac", raw], check=True)
+
+        real_dur = get_duration(raw)
+        generate_ass_subtitles(raw, ass, real_dur, enable_captions,
+                               caption_style, enable_hook, hook_text)
+        render_vertical_short(raw, final, ass, vertical_blur)
+        for t in (raw, ass):
+            if os.path.exists(t):
+                os.remove(t)
+        yield final, f"Clip saved ({count} messages/30s)", hype_html(count, threshold)
+
+    except Exception as e:
+        yield None, f"Error: {e}", hype_html(0, threshold)
+    finally:
+        if recorder and recorder.poll() is None:
+            recorder.terminate()
+        shutil.rmtree(rec_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------
+
+# ---------------------------------------------------------------
+# 3) Montage: merge several videos into one edited 9:16 video
+# ---------------------------------------------------------------
+def has_audio(path: str) -> bool:
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a",
+         "-show_entries", "stream=codec_type", "-of", "csv=p=0", path],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    return bool(out)
+
+
+def normalize_segment(src, start, length, out_path, vertical_blur=True, use_fade=True):
+    """Cut one piece and convert it to 1080x1920, 30fps, stereo audio (so pieces can be joined)."""
+    fade = 0.3 if (use_fade and length > 1.5) else 0
+    if vertical_blur:
+        fc = ("[0:v]scale=1080:1920:force_original_aspect_ratio=increase,"
+              "crop=1080:1920,boxblur=25:10[bg];"
+              "[0:v]scale=1080:-2[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2")
+    else:
+        fc = "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
+    fc += ",setsar=1,fps=30,format=yuv420p"
+    af = "aresample=44100,aformat=channel_layouts=stereo"
+    if fade:
+        fc += f",fade=t=in:st=0:d={fade},fade=t=out:st={length - fade:.2f}:d={fade}"
+        af += f",afade=t=in:st=0:d={fade},afade=t=out:st={length - fade:.2f}:d={fade}"
+    fc += "[outv]"
+
+    audio = has_audio(src)
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-ss", str(start), "-i", src]
+    if not audio:
+        cmd += ["-f", "lavfi", "-t", str(length), "-i", "anullsrc=r=44100:cl=stereo"]
+    cmd += ["-filter_complex", fc, "-map", "[outv]", "-map", "0:a" if audio else "1:a",
+            "-af", af, "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+            "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+            "-t", str(length), out_path]
+    subprocess.run(cmd, check=True)
+
+
+def finish_montage(joined, ass, out, speed, music, music_vol, use_subs):
+    """Burn subtitles, change speed, mix background music."""
+    vf = f"setpts=PTS/{speed}"
+    if use_subs:
+        a = ass.replace("\\", "/").replace(":", "\\:")
+        vf = f"subtitles='{a}'," + vf
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", joined]
+    if music:
+        cmd += ["-stream_loop", "-1", "-i", music]
+        fc = (f"[0:v]{vf}[v];[0:a]atempo={speed}[a0];[1:a]volume={music_vol}[m];"
+              "[a0][m]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a]")
+    else:
+        fc = f"[0:v]{vf}[v];[0:a]atempo={speed}[a]"
+    cmd += ["-filter_complex", fc, "-map", "[v]", "-map", "[a]",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+            "-c:a", "aac", "-b:a", "160k", "-shortest", out]
+    subprocess.run(cmd, check=True)
+
+
+def join_segments(parts, transition_name, out, td=0.5):
+    """Join normalized pieces: plain concat, or crossfade/xfade transitions."""
+    tr = TRANSITIONS.get(transition_name)
+    if tr is None or len(parts) == 1:
+        lst = out + ".txt"
+        with open(lst, "w") as f:
+            for p in parts:
+                f.write(f"file '{os.path.abspath(p)}'\n")
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
+                        "-i", lst, "-c", "copy", out], check=True)
+        os.remove(lst)
+        return
+    durs = [get_duration(p) for p in parts]
+    td = max(0.1, min(td, min(durs) / 3))
+    cmd = ["ffmpeg", "-y", "-loglevel", "error"]
+    for p in parts:
+        cmd += ["-i", p]
+    fv, fa = [], []
+    vl, al, total = "[0:v]", "[0:a]", durs[0]
+    for i in range(1, len(parts)):
+        fv.append(f"{vl}[{i}:v]xfade=transition={tr}:duration={td:.2f}:offset={total - td:.3f}[v{i}]")
+        fa.append(f"{al}[{i}:a]acrossfade=d={td:.2f}[a{i}]")
+        vl, al = f"[v{i}]", f"[a{i}]"
+        total += durs[i] - td
+    cmd += ["-filter_complex", ";".join(fv + fa), "-map", vl, "-map", al,
+            "-c:v", "libx264", "-preset", "fast", "-crf", "22", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k", out]
+    subprocess.run(cmd, check=True)
+
+
+def process_montage(files, seg_len, auto_best, transition, vertical_blur, enable_captions,
+                    caption_style, enable_hook, hook_text, speed, music, music_vol):
+    if not files:
+        return None, "Upload at least one video."
+    paths = [f if isinstance(f, str) else getattr(f, "name", str(f)) for f in files][:20]
+    job = uuid.uuid4().hex[:8]
+    work = os.path.join(OUTPUT_DIR, f"montage_{job}")
+    os.makedirs(work, exist_ok=True)
+    final = os.path.join(OUTPUT_DIR, f"montage_{job}.mp4")
+    try:
+        parts = []
+        for i, p in enumerate(paths):
+            dur = get_duration(p)
+            length = round(min(float(seg_len), dur), 2)
+            start = 0.0
+            if auto_best and dur > length:
+                start = find_viral_peak_timestamp(p, max(1, int(length)))
+                start = max(0.0, min(start, dur - length))
+            seg = os.path.join(work, f"seg_{i:02d}.mp4")
+            normalize_segment(p, start, length, seg, vertical_blur, use_fade=(transition == "None"))
+            parts.append(seg)
+
+        joined = os.path.join(work, "joined.mp4")
+        join_segments(parts, transition, joined)
+
+        ass = os.path.join(work, "subs.ass")
+        use_subs = bool(enable_captions or (enable_hook and (hook_text or "").strip()))
+        if use_subs:
+            generate_ass_subtitles(joined, ass, get_duration(joined), enable_captions,
+                                   caption_style, enable_hook, hook_text or "")
+        finish_montage(joined, ass, final, float(speed), music, float(music_vol), use_subs)
+        return final, f"Montage ready: {len(parts)} clips joined."
+    except Exception as e:
+        return None, f"Error: {e}"
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+# ---------------------------------------------------------------
+# 4) AI Auto-Montage: find the best moments of ONE long video and edit them
+# ---------------------------------------------------------------
+def audio_energies(path):
+    """Loudness (RMS) of every second of the video."""
+    if not has_audio(path):
+        return np.zeros(0)
+    wav = f"{path}_en.wav"
+    subprocess.run(["ffmpeg", "-y", "-i", path, "-ac", "1", "-ar", "16000", wav],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    with wave.open(wav, "rb") as wf:
+        sr = wf.getframerate()
+        data = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).astype(np.float32)
+    os.remove(wav)
+    secs = int(len(data) / sr)
+    return np.array([np.sqrt(np.mean(data[s * sr:(s + 1) * sr] ** 2)) for s in range(secs)])
+
+
+def scene_change_times(path, thr=0.35):
+    """Times of visual cuts / fast motion (more cuts = more action)."""
+    r = subprocess.run(
+        ["ffmpeg", "-i", path, "-vf", f"scale=320:-2,select='gt(scene,{thr})',showinfo",
+         "-an", "-f", "null", "-"], capture_output=True, text=True)
+    return [float(x) for x in re.findall(r"pts_time:([0-9.]+)", r.stderr)]
+
+
+def analyze_highlights(path, n, seg_len):
+    """Score each second = 70% loudness + 30% visual activity, then pick the
+    best non-overlapping windows. Returns a sorted list of start times."""
+    dur = get_duration(path)
+    L = max(1, int(seg_len))
+    secs = int(dur)
+    if secs <= L:
+        return [0.0]
+    n = max(1, min(int(n), secs // L))
+
+    score = np.zeros(secs)
+    en = audio_energies(path)[:secs]
+    if len(en) and en.max() > 0:
+        score[:len(en)] += 0.7 * en / en.max()
+    sc = np.zeros(secs)
+    for t in scene_change_times(path):
+        if int(t) < secs:
+            sc[int(t)] += 1
+    if sc.max() > 0:
+        score += 0.3 * sc / sc.max()
+
+    nwin = secs - L + 1
+    csum = np.concatenate([[0.0], np.cumsum(score)])
+    win = (csum[L:L + nwin] - csum[:nwin]) / L
+    picks = []
+    for _ in range(n):
+        s = int(np.argmax(win))
+        if win[s] < 0:
+            break
+        picks.append(s)
+        win[max(0, s - L + 1):min(nwin, s + L)] = -1
+    starts = [max(0.0, min(float(s) - 2.0, dur - L)) for s in picks]  # 2s build-up
+    return sorted(starts)
+
+
+def make_hook(segments, fallback="WAIT FOR IT!"):
+    """Pick the most 'hooky' spoken sentence (questions, exclamations, numbers)."""
+    best, best_score = None, 0
+    for seg in segments or []:
+        t = seg.text.strip()
+        n = len(t.split())
+        if n < 3:
+            continue
+        sc = (2 if "?" in t else 0) + (2 if "!" in t else 0) \
+            + (1 if any(c.isdigit() for c in t) else 0) + (1 if 4 <= n <= 10 else 0)
+        if sc > best_score:
+            best, best_score = t, sc
+    if not best:
+        return fallback
+    words = best.split()
+    return " ".join(words[:8]).rstrip(",.;:") + ("..." if len(words) > 8 else "")
+
+
+def fmt_clock(sec):
+    return f"{int(sec // 60):02d}:{int(sec % 60):02d}"
+
+
+def process_ai_montage(url, upload, cookies, n_clips, seg_len, transition, vertical_blur,
+                       enable_captions, caption_style, auto_hook, hook_text,
+                       speed, music, music_vol):
+    if not (url or "").strip() and not upload:
+        return None, "Paste a YouTube link or upload a video."
+    job = uuid.uuid4().hex[:8]
+    work = os.path.join(OUTPUT_DIR, f"ai_{job}")
+    os.makedirs(work, exist_ok=True)
+    final = os.path.join(OUTPUT_DIR, f"ai_montage_{job}.mp4")
+    try:
+        src = os.path.join(work, "source.mp4")
+        if upload:
+            shutil.copy(upload, src)
+        else:
+            download_youtube_video(url, src, cookies)
+
+        starts = analyze_highlights(src, n_clips, seg_len)
+        dur = get_duration(src)
+        length = round(min(float(seg_len), dur), 2)
+        parts = []
+        for i, st in enumerate(starts):
+            seg = os.path.join(work, f"seg_{i:02d}.mp4")
+            normalize_segment(src, st, length, seg, vertical_blur, use_fade=(transition == "None"))
+            parts.append(seg)
+
+        joined = os.path.join(work, "joined.mp4")
+        join_segments(parts, transition, joined)
+        total = get_duration(joined)
+
+        segments = None
+        if enable_captions or auto_hook:
+            segments, _ = whisper_model.transcribe(joined, word_timestamps=True)
+            segments = list(segments)
+        hook = make_hook(segments, hook_text or "WAIT FOR IT!") if auto_hook else (hook_text or "")
+
+        ass = os.path.join(work, "subs.ass")
+        use_subs = bool(enable_captions or hook.strip())
+        if use_subs:
+            generate_ass_subtitles(joined, ass, total, enable_captions, caption_style,
+                                   bool(hook.strip()), hook, segments=segments, hook_seconds=4.0)
+        finish_montage(joined, ass, final, float(speed), music, float(music_vol), use_subs)
+        moments = ", ".join(fmt_clock(x) for x in starts)
+        msg = f"AI montage ready: {len(parts)} moments at {moments}."
+        if hook.strip():
+            msg += f" Hook: {hook.upper()}"
+        return final, msg
+    except Exception as e:
+        return None, f"Error: {e}"
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+# ---------------------------------------------------------------
+# 5) Silence remover (jump cuts for talking videos)
+# ---------------------------------------------------------------
+def silence_keep_intervals(path, noise_db=-35, min_silence=0.5, pad=0.12):
+    dur = get_duration(path)
+    r = subprocess.run(
+        ["ffmpeg", "-i", path, "-af", f"silencedetect=noise={noise_db}dB:d={min_silence}",
+         "-f", "null", "-"], capture_output=True, text=True)
+    starts = [float(x) for x in re.findall(r"silence_start: (-?[0-9.]+)", r.stderr)]
+    ends = [float(x) for x in re.findall(r"silence_end: ([0-9.]+)", r.stderr)]
+    keep, pos = [], 0.0
+    for i, st in enumerate(starts):
+        st = max(0.0, st)
+        en = ends[i] if i < len(ends) else dur
+        if st + pad > pos + 0.05:
+            keep.append((pos, min(dur, st + pad)))
+        pos = max(pos, en - pad)
+    if dur - pos > 0.05:
+        keep.append((pos, dur))
+    return keep, dur
+
+
+def process_silence(upload, noise_db, min_silence):
+    if not upload:
+        return None, "Upload a video."
+    job = uuid.uuid4().hex[:8]
+    final = os.path.join(OUTPUT_DIR, f"nosilence_{job}.mp4")
+    script = os.path.join(OUTPUT_DIR, f"sil_{job}.txt")
+    try:
+        if not has_audio(upload):
+            return None, "This video has no audio."
+        keep, dur = silence_keep_intervals(upload, noise_db, min_silence)
+        if not keep:
+            return None, "Nothing to keep (all silence?). Try a lower threshold."
+        expr = "+".join(f"between(t,{a:.3f},{b:.3f})" for a, b in keep)
+        with open(script, "w") as f:
+            f.write(f"[0:v]select='{expr}',setpts=N/FRAME_RATE/TB[v];"
+                    f"[0:a]aselect='{expr}',asetpts=N/SR/TB[a]")
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", upload,
+                        "-filter_complex_script", script, "-map", "[v]", "-map", "[a]",
+                        "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+                        "-c:a", "aac", "-b:a", "128k", final], check=True)
+        new = get_duration(final)
+        return final, f"Done: {dur:.1f}s -> {new:.1f}s (removed {dur - new:.1f}s of silence)."
+    except Exception as e:
+        return None, f"Error: {e}"
+    finally:
+        if os.path.exists(script):
+            os.remove(script)
+
+
+with gr.Blocks(theme=gr.themes.Soft(primary_hue="violet"), title="AI Viral Clipper") as app:
+    gr.Markdown("# AI Viral Clipper\nTurn videos and live streams into ready 9:16 clips.")
+
+    with gr.Tabs():
+        with gr.TabItem("📹 Normal Video"):
+            v_url = gr.Textbox(label="YouTube Video URL (optional if you upload)", placeholder="https://www.youtube.com/watch?v=...")
+            v_upload = gr.Video(label="OR upload a video from your phone", sources=["upload"])
+            v_cookies = gr.File(label="cookies.txt (optional, only if YouTube blocks the link)", type="filepath")
+            with gr.Row():
+                v_dur = gr.Radio(["10s", "20s", "30s"], value="30s", label="Clip Duration")
+                v_blur = gr.Checkbox(True, label="9:16 (Vertical Blur)")
+            with gr.Row():
+                v_cap = gr.Checkbox(True, label="Dynamic Auto-Captions")
+                v_style = gr.Dropdown(CAPTION_STYLES,
+                                      value="Viral Yellow", label="Caption Style")
+            with gr.Row():
+                v_hook_on = gr.Checkbox(True, label="Hook Title Header")
+                v_hook = gr.Textbox(value="WAIT FOR IT!", label="Top Hook Text")
+            v_btn = gr.Button("🚀 Generate Viral Clip", variant="primary")
+            v_status = gr.Textbox(label="Status", interactive=False)
+            v_out = gr.Video(label="Ready 9:16 Clip")
+            v_btn.click(process_normal_video,
+                        [v_url, v_upload, v_cookies, v_dur, v_blur, v_cap, v_style, v_hook_on, v_hook],
+                        [v_out, v_status])
+
+        with gr.TabItem("🔴 Live Stream"):
+            l_url = gr.Textbox(label="YouTube Live Stream Link", placeholder="https://www.youtube.com/live/...")
+            l_cookies = gr.File(label="cookies.txt (optional, only if YouTube blocks the link)", type="filepath")
+            with gr.Row():
+                l_dur = gr.Radio(["10s", "20s", "30s"], value="30s", label="Clip Duration")
+                l_thr = gr.Slider(5, 200, value=30, step=5, label="Hype Threshold (messages / 30s)")
+                l_wait = gr.Slider(30, 900, value=180, step=30, label="Max Monitoring (seconds)")
+            with gr.Row():
+                l_blur = gr.Checkbox(True, label="9:16 (Vertical Blur)")
+                l_cap = gr.Checkbox(True, label="Dynamic Auto-Captions")
+                l_style = gr.Dropdown(CAPTION_STYLES,
+                                      value="Neon Cyan", label="Caption Style")
+            with gr.Row():
+                l_hook_on = gr.Checkbox(True, label="Hook Title Header")
+                l_hook = gr.Textbox(value="INSANE MOMENT!", label="Top Hook Text")
+            l_btn = gr.Button("📡 Start Monitoring Live Chat", variant="primary")
+            l_hype = gr.HTML(hype_html(0, 30))
+            l_status = gr.Textbox(label="Live Status", interactive=False)
+            l_out = gr.Video(label="Auto-Captured Viral Clip")
+            l_btn.click(monitor_live_stream,
+                        [l_url, l_cookies, l_dur, l_thr, l_wait, l_blur, l_cap, l_style, l_hook_on, l_hook],
+                        [l_out, l_status, l_hype])
+
+        with gr.TabItem("Montage (edit videos)"):
+            m_files = gr.File(label="Upload videos (they are joined in this order)",
+                              file_count="multiple", type="filepath")
+            with gr.Row():
+                m_len = gr.Slider(3, 30, value=8, step=1, label="Seconds per video")
+                m_auto = gr.Checkbox(True, label="AI: pick the best moment of each video")
+                m_speed = gr.Slider(0.5, 2.0, value=1.0, step=0.1, label="Speed")
+            with gr.Row():
+                m_trans = gr.Dropdown(list(TRANSITIONS.keys()), value="Fade", label="Transition")
+            with gr.Row():
+                m_blur = gr.Checkbox(True, label="9:16 (Vertical Blur)")
+                m_cap = gr.Checkbox(True, label="Dynamic Auto-Captions")
+                m_style = gr.Dropdown(CAPTION_STYLES,
+                                      value="Viral Yellow", label="Caption Style")
+            with gr.Row():
+                m_hook_on = gr.Checkbox(False, label="Hook Title Header")
+                m_hook = gr.Textbox(value="WAIT FOR IT!", label="Top Hook Text")
+            m_music = gr.Audio(label="Background music (optional)", type="filepath",
+                               sources=["upload"])
+            m_vol = gr.Slider(0.0, 1.0, value=0.25, step=0.05, label="Music volume")
+            m_btn = gr.Button("Create Montage", variant="primary")
+            m_status = gr.Textbox(label="Status", interactive=False)
+            m_out = gr.Video(label="Montage")
+            m_btn.click(process_montage,
+                        [m_files, m_len, m_auto, m_trans, m_blur, m_cap, m_style, m_hook_on, m_hook,
+                         m_speed, m_music, m_vol],
+                        [m_out, m_status])
+
+        with gr.TabItem("AI Auto-Montage"):
+            gr.Markdown("Give ONE long video. The AI finds the best moments (loudness + action), "
+                        "cuts them, joins them with transitions, adds captions, an auto hook and music.")
+            a_url = gr.Textbox(label="YouTube Video URL (optional if you upload)", placeholder="https://www.youtube.com/watch?v=...")
+            a_upload = gr.Video(label="OR upload a long video", sources=["upload"])
+            a_cookies = gr.File(label="cookies.txt (optional)", type="filepath")
+            with gr.Row():
+                a_n = gr.Slider(2, 10, value=5, step=1, label="Number of highlights")
+                a_len = gr.Slider(4, 20, value=8, step=1, label="Seconds per highlight")
+                a_speed = gr.Slider(0.5, 2.0, value=1.0, step=0.1, label="Speed")
+            with gr.Row():
+                a_trans = gr.Dropdown(list(TRANSITIONS.keys()), value="Fade", label="Transition")
+                a_blur = gr.Checkbox(True, label="9:16 (Vertical Blur)")
+            with gr.Row():
+                a_cap = gr.Checkbox(True, label="Dynamic Auto-Captions")
+                a_style = gr.Dropdown(CAPTION_STYLES, value="Karaoke", label="Caption Style")
+            with gr.Row():
+                a_auto_hook = gr.Checkbox(True, label="AI Hook (pick from what is said)")
+                a_hook = gr.Textbox(value="WAIT FOR IT!", label="Hook (fallback if no speech)")
+            a_music = gr.Audio(label="Background music (optional)", type="filepath", sources=["upload"])
+            a_vol = gr.Slider(0.0, 1.0, value=0.25, step=0.05, label="Music volume")
+            a_btn = gr.Button("Create AI Montage", variant="primary")
+            a_status = gr.Textbox(label="Status", interactive=False)
+            a_out = gr.Video(label="AI Montage")
+            a_btn.click(process_ai_montage,
+                        [a_url, a_upload, a_cookies, a_n, a_len, a_trans, a_blur, a_cap, a_style,
+                         a_auto_hook, a_hook, a_speed, a_music, a_vol],
+                        [a_out, a_status])
+
+        with gr.TabItem("Silence Remover"):
+            gr.Markdown("Cuts the silent parts of a talking video (jump cuts).")
+            s_upload = gr.Video(label="Upload a video", sources=["upload"])
+            with gr.Row():
+                s_db = gr.Slider(-60, -20, value=-35, step=1, label="Silence threshold (dB, higher = cuts more)")
+                s_min = gr.Slider(0.3, 2.0, value=0.5, step=0.1, label="Min silence length (seconds)")
+            s_btn = gr.Button("Remove Silence", variant="primary")
+            s_status = gr.Textbox(label="Status", interactive=False)
+            s_out = gr.Video(label="Result")
+            s_btn.click(process_silence, [s_upload, s_db, s_min], [s_out, s_status])
+
+if __name__ == "__main__":
+    app.queue().launch(share=True, debug=True)

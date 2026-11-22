@@ -1,6 +1,14 @@
 package com.example.model
 
-import android.graphics.Color as AndroidColor
+import android.graphics.Bitmap
+import android.net.Uri
+
+enum class StudioToolMode(val label: String, val testTag: String) {
+    VIRAL_CLIP("Viral Clip", "tool_mode_viral_clip"),
+    MONTAGE("Montage", "tool_mode_montage"),
+    AI_AUTO_MONTAGE("AI Auto-Montage", "tool_mode_ai_montage"),
+    SILENCE_REMOVER("Silence Cut", "tool_mode_silence_remover")
+}
 
 enum class CaptionStyle(
     val displayName: String,
@@ -9,18 +17,23 @@ enum class CaptionStyle(
 ) {
     VIRAL_YELLOW(
         displayName = "Viral Yellow",
-        primaryColorInt = AndroidColor.rgb(250, 204, 21),
+        primaryColorInt = 0xFFFACC15.toInt(),
         composeColorHex = 0xFFFACC15
     ),
     NEON_CYAN(
         displayName = "Neon Cyan",
-        primaryColorInt = AndroidColor.rgb(34, 211, 238),
+        primaryColorInt = 0xFF22D3EE.toInt(),
         composeColorHex = 0xFF22D3EE
     ),
     MODERN_CLEAN(
         displayName = "Modern Clean",
-        primaryColorInt = AndroidColor.WHITE,
+        primaryColorInt = 0xFFFFFFFF.toInt(),
         composeColorHex = 0xFFF8FAFC
+    ),
+    KARAOKE(
+        displayName = "Karaoke",
+        primaryColorInt = 0xFFFACC15.toInt(),
+        composeColorHex = 0xFFFACC15
     );
 
     companion object {
@@ -29,16 +42,32 @@ enum class CaptionStyle(
     }
 }
 
+enum class TransitionType(val displayName: String) {
+    NONE("None"),
+    FADE("Fade"),
+    SLIDE("Slide"),
+    WIPE("Wipe"),
+    CIRCLE("Circle"),
+    DISSOLVE("Dissolve")
+}
+
 enum class ClipDurationOption(val seconds: Int, val label: String) {
     SEC_10(10, "10s"),
     SEC_20(20, "20s"),
     SEC_30(30, "30s")
 }
 
+data class CaptionWord(
+    val startSec: Double,
+    val endSec: Double,
+    val word: String
+)
+
 data class CaptionSegment(
     val startSec: Double,
     val endSec: Double,
-    val text: String
+    val text: String,
+    val words: List<CaptionWord> = emptyList()
 )
 
 data class ViralAnalysisResult(
@@ -52,6 +81,28 @@ data class AudioEnergyProfile(
     val durationSec: Double,
     val secondEnergies: List<Float>,
     val peakStartSec: Double
+)
+
+data class MontageClipItem(
+    val id: String,
+    val uri: Uri,
+    val displayName: String,
+    val durationSec: Double,
+    val thumbnail: Bitmap?,
+    val peakStartSec: Double
+)
+
+data class TimeRangeSec(
+    val startSec: Double,
+    val endSec: Double
+) {
+    val lengthSec: Double get() = (endSec - startSec).coerceAtLeast(0.0)
+}
+
+data class SilenceAnalysisResult(
+    val originalDurationSec: Double,
+    val newDurationSec: Double,
+    val keepIntervals: List<TimeRangeSec>
 )
 
 data class YouTubeVideoInfo(

@@ -48,14 +48,22 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.data.ClipStorageRepository
+import com.example.model.StudioToolMode
+import com.example.ui.components.StudioToolModeSelector
+import com.example.ui.screens.AiAutoMontageScreen
 import com.example.ui.screens.ClipPlayerDialog
 import com.example.ui.screens.ClipStudioScreen
 import com.example.ui.screens.ClipsVaultScreen
 import com.example.ui.screens.LiveMonitorScreen
+import com.example.ui.screens.MontageScreen
 import com.example.ui.screens.SettingsScreen
+import com.example.ui.screens.SilenceRemoverScreen
 import com.example.ui.theme.ElectricViolet
 import com.example.ui.theme.MutedSlate
 import com.example.ui.theme.ObsidianBg
@@ -121,7 +129,11 @@ fun ViralClipperApp(
     viewModel: ClipperViewModel = viewModel()
 ) {
     val context = LocalContext.current
+    val selectedToolMode by viewModel.selectedToolMode.collectAsStateWithLifecycle()
     val studioState by viewModel.studioState.collectAsStateWithLifecycle()
+    val montageState by viewModel.montageState.collectAsStateWithLifecycle()
+    val aiMontageState by viewModel.aiMontageState.collectAsStateWithLifecycle()
+    val silenceState by viewModel.silenceState.collectAsStateWithLifecycle()
     val liveState by viewModel.liveState.collectAsStateWithLifecycle()
     val vaultState by viewModel.vaultState.collectAsStateWithLifecycle()
     val settingsState by viewModel.settingsState.collectAsStateWithLifecycle()
@@ -132,6 +144,10 @@ fun ViralClipperApp(
     if (currentTab != StudioDestination.CLIP_STUDIO) {
         BackHandler {
             currentTab = StudioDestination.CLIP_STUDIO
+        }
+    } else if (selectedToolMode != StudioToolMode.VIRAL_CLIP) {
+        BackHandler {
+            viewModel.selectToolMode(StudioToolMode.VIRAL_CLIP)
         }
     }
 
@@ -219,27 +235,100 @@ fun ViralClipperApp(
             Box(modifier = Modifier.fillMaxSize()) {
                 when (currentTab) {
                     StudioDestination.CLIP_STUDIO -> {
-                        ClipStudioScreen(
-                            state = studioState,
-                            hasApiKey = settingsState.hasApiKey,
-                            onOpenSettings = { currentTab = StudioDestination.SETTINGS },
-                            onVideoPicked = viewModel::onVideoPicked,
-                            onYoutubeUrlChanged = viewModel::updateYoutubeUrlInput,
-                            onAnalyzeYoutubeUrl = viewModel::analyzeYouTubeUrl,
-                            onSelectDuration = viewModel::selectDuration,
-                            onStartSecChanged = viewModel::updateStartSec,
-                            onSnapToPeak = {
-                                studioState.energyProfile?.let { viewModel.updateStartSec(it.peakStartSec) }
-                            },
-                            onToggleVerticalBlur = viewModel::toggleVerticalBlur,
-                            onToggleCaptions = viewModel::toggleCaptions,
-                            onSelectCaptionStyle = viewModel::selectCaptionStyle,
-                            onToggleHook = viewModel::toggleHook,
-                            onHookTextChanged = viewModel::updateHookText,
-                            onSuggestHookWithAi = viewModel::suggestHookWithAi,
-                            onGenerateClip = viewModel::generateViralClip,
-                            onPlayGeneratedClip = viewModel::openClipPlayer
-                        )
+                        Column(modifier = Modifier.fillMaxSize()) {
+                            StudioToolModeSelector(
+                                selected = selectedToolMode,
+                                onSelect = viewModel::selectToolMode,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 16.dp, vertical = 10.dp)
+                            )
+                            Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                                when (selectedToolMode) {
+                                    StudioToolMode.VIRAL_CLIP -> {
+                                        ClipStudioScreen(
+                                            state = studioState,
+                                            hasApiKey = settingsState.hasApiKey,
+                                            onOpenSettings = { currentTab = StudioDestination.SETTINGS },
+                                            onVideoPicked = viewModel::onVideoPicked,
+                                            onYoutubeUrlChanged = viewModel::updateYoutubeUrlInput,
+                                            onAnalyzeYoutubeUrl = viewModel::analyzeYouTubeUrl,
+                                            onSelectDuration = viewModel::selectDuration,
+                                            onStartSecChanged = viewModel::updateStartSec,
+                                            onSnapToPeak = {
+                                                studioState.energyProfile?.let { viewModel.updateStartSec(it.peakStartSec) }
+                                            },
+                                            onToggleVerticalBlur = viewModel::toggleVerticalBlur,
+                                            onToggleCaptions = viewModel::toggleCaptions,
+                                            onSelectCaptionStyle = viewModel::selectCaptionStyle,
+                                            onToggleHook = viewModel::toggleHook,
+                                            onHookTextChanged = viewModel::updateHookText,
+                                            onSuggestHookWithAi = viewModel::suggestHookWithAi,
+                                            onGenerateClip = viewModel::generateViralClip,
+                                            onPlayGeneratedClip = viewModel::openClipPlayer
+                                        )
+                                    }
+
+                                    StudioToolMode.MONTAGE -> {
+                                        MontageScreen(
+                                            state = montageState,
+                                            onAddVideos = viewModel::onMontageVideosPicked,
+                                            onRemoveClip = viewModel::removeMontageClip,
+                                            onMoveClip = viewModel::moveMontageClip,
+                                            onSegLenChanged = viewModel::updateMontageSegLen,
+                                            onToggleAutoBest = viewModel::toggleMontageAutoBest,
+                                            onSpeedChanged = viewModel::updateMontageSpeed,
+                                            onSelectTransition = viewModel::selectMontageTransition,
+                                            onToggleBlur = viewModel::toggleMontageBlur,
+                                            onToggleCaptions = viewModel::toggleMontageCaptions,
+                                            onSelectCaptionStyle = viewModel::selectMontageCaptionStyle,
+                                            onToggleHook = viewModel::toggleMontageHook,
+                                            onHookTextChanged = viewModel::updateMontageHookText,
+                                            onMusicPicked = viewModel::onMontageMusicPicked,
+                                            onClearMusic = viewModel::clearMontageMusic,
+                                            onMusicVolumeChanged = viewModel::updateMontageMusicVol,
+                                            onGenerateMontage = viewModel::generateMontage,
+                                            onPlayClip = viewModel::openClipPlayer
+                                        )
+                                    }
+
+                                    StudioToolMode.AI_AUTO_MONTAGE -> {
+                                        AiAutoMontageScreen(
+                                            state = aiMontageState,
+                                            onPickVideo = viewModel::onAiMontageVideoPicked,
+                                            onYoutubeUrlChanged = viewModel::updateAiMontageYoutubeUrl,
+                                            onAnalyzeYoutubeUrl = viewModel::analyzeAiMontageYoutubeUrl,
+                                            onNClipsChanged = viewModel::updateAiMontageNClips,
+                                            onSegLenChanged = viewModel::updateAiMontageSegLen,
+                                            onSpeedChanged = viewModel::updateAiMontageSpeed,
+                                            onSelectTransition = viewModel::selectAiMontageTransition,
+                                            onToggleBlur = viewModel::toggleAiMontageBlur,
+                                            onToggleCaptions = viewModel::toggleAiMontageCaptions,
+                                            onSelectCaptionStyle = viewModel::selectAiMontageCaptionStyle,
+                                            onToggleAutoHook = viewModel::toggleAiMontageAutoHook,
+                                            onHookTextChanged = viewModel::updateAiMontageHookText,
+                                            onMusicPicked = viewModel::onAiMontageMusicPicked,
+                                            onClearMusic = viewModel::clearAiMontageMusic,
+                                            onMusicVolumeChanged = viewModel::updateAiMontageMusicVol,
+                                            onGenerateAiAutoMontage = viewModel::generateAiAutoMontage,
+                                            onPlayClip = viewModel::openClipPlayer
+                                        )
+                                    }
+
+                                    StudioToolMode.SILENCE_REMOVER -> {
+                                        SilenceRemoverScreen(
+                                            state = silenceState,
+                                            onPickVideo = viewModel::onSilenceVideoPicked,
+                                            onNoiseDbChanged = viewModel::updateSilenceNoiseDb,
+                                            onMinSilenceChanged = viewModel::updateSilenceMinSec,
+                                            onRescanSilence = viewModel::analyzeSilencePreview,
+                                            onRemoveSilence = viewModel::removeSilence,
+                                            onPlayClip = viewModel::openClipPlayer
+                                        )
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     StudioDestination.LIVE_MONITOR -> {

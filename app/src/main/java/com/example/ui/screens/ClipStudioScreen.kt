@@ -22,11 +22,9 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.MovieCreation
-import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.RocketLaunch
 import androidx.compose.material.icons.filled.VideoLibrary
 import androidx.compose.material3.Button
@@ -34,7 +32,6 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -42,8 +39,6 @@ import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Switch
-import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.minimumInteractiveComponentSize
@@ -67,8 +62,10 @@ import com.example.model.SavedClip
 import com.example.ui.components.AudioEnergyWaveformCard
 import com.example.ui.components.CaptionStyleSelector
 import com.example.ui.components.DurationSegmentedRow
+import com.example.ui.components.PipelineStatusCard
 import com.example.ui.components.Short916PreviewCard
 import com.example.ui.components.StudioHeroBanner
+import com.example.ui.components.StudioToggleRow
 import com.example.ui.components.formatTime
 import com.example.ui.theme.DeckContainer
 import com.example.ui.theme.ElectricViolet
@@ -578,197 +575,6 @@ fun ClipStudioScreen(
             }
 
             item { Spacer(modifier = Modifier.height(16.dp)) }
-        }
-    }
-}
-
-@Composable
-private fun StudioToggleRow(
-    title: String,
-    subtitle: String,
-    checked: Boolean,
-    onCheckedChange: (Boolean) -> Unit,
-    testTag: String
-) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Column(
-            modifier = Modifier
-                .weight(1f)
-                .padding(end = 12.dp)
-        ) {
-            Text(
-                text = title,
-                style = MaterialTheme.typography.titleMedium,
-                color = Color.White
-            )
-            Text(
-                text = subtitle,
-                style = MaterialTheme.typography.bodyMedium,
-                color = MutedSlate
-            )
-        }
-        Switch(
-            checked = checked,
-            onCheckedChange = onCheckedChange,
-            colors = SwitchDefaults.colors(
-                checkedThumbColor = Color.White,
-                checkedTrackColor = ElectricViolet
-            ),
-            modifier = Modifier.testTag(testTag)
-        )
-    }
-}
-
-@Composable
-private fun PipelineStatusCard(
-    pipelineState: ClipPipelineState,
-    peakReason: String?,
-    onPlayClip: (SavedClip) -> Unit
-) {
-    when (pipelineState) {
-        ClipPipelineState.Idle -> Unit
-        is ClipPipelineState.AnalyzingAudio -> {
-            StatusBannerSurface(
-                borderColor = NeonCyan,
-                title = pipelineState.stepMessage,
-                progress = null
-            )
-        }
-        is ClipPipelineState.GeneratingCaptions -> {
-            StatusBannerSurface(
-                borderColor = ElectricViolet,
-                title = pipelineState.stepMessage,
-                progress = null
-            )
-        }
-        is ClipPipelineState.RenderingClip -> {
-            StatusBannerSurface(
-                borderColor = ViralYellow,
-                title = pipelineState.stepMessage,
-                progress = pipelineState.progress
-            )
-        }
-        is ClipPipelineState.Success -> {
-            Surface(
-                shape = MaterialTheme.shapes.medium,
-                color = StudioSurface,
-                border = BorderStroke(1.5.dp, MintSuccess)
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Filled.CheckCircle,
-                            contentDescription = null,
-                            tint = MintSuccess
-                        )
-                        Text(
-                            text = pipelineState.message,
-                            style = MaterialTheme.typography.titleMedium,
-                            color = MintSuccess
-                        )
-                    }
-                    if (!peakReason.isNullOrBlank()) {
-                        Text(
-                            text = peakReason,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MutedSlate
-                        )
-                    }
-                    Button(
-                        onClick = { onPlayClip(pipelineState.clip) },
-                        colors = ButtonDefaults.buttonColors(containerColor = ElectricViolet),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .minimumInteractiveComponentSize()
-                            .testTag("play_generated_clip_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Filled.PlayArrow,
-                            contentDescription = null
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Watch Ready 9:16 Clip")
-                    }
-                }
-            }
-        }
-        is ClipPipelineState.Error -> {
-            Surface(
-                shape = MaterialTheme.shapes.medium,
-                color = StudioSurface,
-                border = BorderStroke(1.5.dp, PeakRed)
-            ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(16.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Filled.ErrorOutline,
-                        contentDescription = null,
-                        tint = PeakRed
-                    )
-                    Text(
-                        text = pipelineState.message,
-                        style = MaterialTheme.typography.bodyLarge,
-                        color = PeakRed
-                    )
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun StatusBannerSurface(
-    borderColor: Color,
-    title: String,
-    progress: Float?
-) {
-    Surface(
-        shape = MaterialTheme.shapes.medium,
-        color = StudioSurface,
-        border = BorderStroke(1.dp, borderColor)
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            Text(
-                text = title,
-                style = MaterialTheme.typography.titleMedium,
-                color = Color.White
-            )
-            if (progress != null) {
-                LinearProgressIndicator(
-                    progress = { progress },
-                    modifier = Modifier.fillMaxWidth(),
-                    color = borderColor,
-                    trackColor = ObsidianBg
-                )
-            } else {
-                LinearProgressIndicator(
-                    modifier = Modifier.fillMaxWidth(),
-                    color = borderColor,
-                    trackColor = ObsidianBg
-                )
-            }
         }
     }
 }

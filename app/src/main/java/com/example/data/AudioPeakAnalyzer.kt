@@ -11,23 +11,29 @@ import android.net.Uri
 import android.provider.OpenableColumns
 import android.util.Log
 import com.example.model.AudioEnergyProfile
+import com.example.model.SilenceAnalysisResult
+import com.example.model.TimeRangeSec
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.nio.ByteBuffer
+import kotlin.math.abs
+import kotlin.math.log10
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
 private const val TAG = "AudioPeakAnalyzer"
-private const val MAX_INLINE_AUDIO_BYTES = 18 * 1024 * 1024 // Keep well under 20MB Gemini inline limit
+private const val MAX_INLINE_AUDIO_BYTES = 18 * 1024 * 1024
 
 data class VideoMediaMetadata(
     val displayName: String,
     val durationSec: Double,
     val width: Int,
     val height: Int,
-    val thumbnail: Bitmap?
+    val thumbnail: Bitmap?,
+    val hasAudio: Boolean = true
 )
 
 object AudioPeakAnalyzer {
@@ -46,6 +52,9 @@ object AudioPeakAnalyzer {
                 val height = retriever.extractMetadata(
                     MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT
                 )?.toIntOrNull() ?: 1080
+                val hasAudioStr = retriever.extractMetadata(
+                    MediaMetadataRetriever.METADATA_KEY_HAS_AUDIO
+                )
                 val thumb = retriever.getFrameAtTime(
                     min(durationMs * 1000L / 4L, 2_000_000L),
                     MediaMetadataRetriever.OPTION_CLOSEST_SYNC
@@ -56,12 +65,28 @@ object AudioPeakAnalyzer {
                     durationSec = durationMs / 1000.0,
                     width = width,
                     height = height,
-                    thumbnail = thumb
+                    thumbnail = thumb,
+                    hasAudio = hasAudioStr != "no"
                 )
             } finally {
                 runCatching { retriever.release() }
             }
         }
+
+    fun hasAudioTrack(context: Context, uri: Uri): Boolean {
+        val extractor = MediaExtractor()
+        return try {
+            extractor.setDataSource(context, uri, null)
+            (0 until extractor.trackCount).any { idx ->
+                extractor.getTrackFormat(idx).getString(MediaFormat.KEY_MIME)
+                    ?.startsWith("audio/") == true
+            }
+        } catch (_: Exception) {
+            false
+        } finally {
+            runCatching { extractor.release() }
+        }
+    }
 
     private fun resolveDisplayName(context: Context, uri: Uri): String? {
         return runCatching {
@@ -76,8 +101,7 @@ object AudioPeakAnalyzer {
     }
 
     /**
-     * Ports the Colab RMS peak detector to Android using MediaExtractor + MediaCodec PCM decoding.
-     * Computes 1-second RMS energy buckets and starts the viral clip 5 seconds before the peak window.
+     * Computes per-second RMS loudness and starts the clip 5 seconds before the loudest window.
      */
     suspend fun analyzeAudioEnergy(
         context: Context,
@@ -87,13 +111,243 @@ object AudioPeakAnalyzer {
         val meta = getVideoMetadata(context, uri)
         val totalSecInt = max(1, meta.durationSec.toInt())
         if (meta.durationSec <= clipDurationSec) {
-            val flat = List(totalSecInt) { 0.5f }
-            return@withContext AudioEnergyProfile(meta.durationSec, flat, 0.0)
+            return@withContext AudioEnergyProfile(meta.durationSec, List(totalSecInt) { 0.5f }, 0.0)
         }
 
+        val rawRms = decodeBucketedRms(context, uri, bucketDurationMs = 1000, maxBuckets = totalSecInt)
+        if (rawRms.isEmpty()) {
+            return@withContext AudioEnergyProfile(
+                durationSec = meta.durationSec,
+                secondEnergies = List(totalSecInt) { 0.25f },
+                peakStartSec = 0.0
+            )
+        }
+
+        val maxRms = rawRms.maxOrNull()?.takeIf { it > 0.0 } ?: 1.0
+        val normalized = rawRms.map { (it / maxRms).toFloat().coerceIn(0f, 1f) }
+
+        var bestStart = 0
+        var bestMean = -1.0
+        val windowEndLimit = max(1, rawRms.size - clipDurationSec)
+        for (s in 0 until windowEndLimit) {
+            val end = min(rawRms.size, s + clipDurationSec)
+            var sum = 0.0
+            for (k in s until end) sum += rawRms[k]
+            val mean = sum / max(1, end - s)
+            if (mean > bestMean) {
+                bestMean = mean
+                bestStart = s
+            }
+        }
+
+        val peakStart = max(0.0, (bestStart - 5).toDouble())
+            .coerceAtMost(max(0.0, meta.durationSec - clipDurationSec))
+
+        AudioEnergyProfile(
+            durationSec = meta.durationSec,
+            secondEnergies = normalized,
+            peakStartSec = peakStart
+        )
+    }
+
+    /**
+     * Ports AI Auto-Montage's highlight scorer:
+     * 70% audio loudness (RMS) + 30% visual scene/action change intensity, picking N non-overlapping moments.
+     */
+    suspend fun analyzeHighlights(
+        context: Context,
+        uri: Uri,
+        nClips: Int,
+        segLenSec: Int
+    ): List<Double> = withContext(Dispatchers.IO) {
+        val meta = getVideoMetadata(context, uri)
+        val dur = meta.durationSec
+        val len = max(1, segLenSec)
+        val secs = dur.toInt()
+        if (secs <= len) return@withContext listOf(0.0)
+
+        val targetCount = max(1, min(nClips, secs / len))
+        val scores = DoubleArray(secs)
+
+        // 70% Audio RMS energy
+        val audioRms = decodeBucketedRms(context, uri, bucketDurationMs = 1000, maxBuckets = secs)
+        val maxAudio = audioRms.maxOrNull()?.takeIf { it > 0.0 } ?: 0.0
+        if (maxAudio > 0.0) {
+            for (i in 0 until min(secs, audioRms.size)) {
+                scores[i] += 0.7 * (audioRms[i] / maxAudio)
+            }
+        }
+
+        // 30% Visual scene/motion activity
+        val sceneScores = computeSceneActivityScores(context, uri, secs)
+        val maxScene = sceneScores.maxOrNull()?.takeIf { it > 0.0 } ?: 0.0
+        if (maxScene > 0.0) {
+            for (i in 0 until secs) {
+                scores[i] += 0.3 * (sceneScores[i] / maxScene)
+            }
+        }
+
+        // Prefix sum sliding windows
+        val nWin = secs - len + 1
+        val prefix = DoubleArray(secs + 1)
+        for (i in 0 until secs) prefix[i + 1] = prefix[i] + scores[i]
+        val winScores = DoubleArray(nWin) { s -> (prefix[s + len] - prefix[s]) / len }
+
+        val picks = mutableListOf<Int>()
+        repeat(targetCount) {
+            var bestIdx = -1
+            var bestVal = -1.0
+            for (i in winScores.indices) {
+                if (winScores[i] > bestVal) {
+                    bestVal = winScores[i]
+                    bestIdx = i
+                }
+            }
+            if (bestIdx < 0 || bestVal < 0.0) return@repeat
+            picks.add(bestIdx)
+            val suppressFrom = max(0, bestIdx - len + 1)
+            val suppressTo = min(nWin, bestIdx + len)
+            for (k in suppressFrom until suppressTo) {
+                winScores[k] = -1.0
+            }
+        }
+
+        picks.map { s ->
+            max(0.0, min(s.toDouble() - 2.0, dur - len))
+        }.sorted()
+    }
+
+    private fun computeSceneActivityScores(context: Context, uri: Uri, totalSecs: Int): DoubleArray {
+        val scores = DoubleArray(totalSecs)
+        if (totalSecs < 2) return scores
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(context, uri)
+            val strideSec = max(1, totalSecs / 48)
+            var prevLuma: IntArray? = null
+            var sec = 0
+            while (sec < totalSecs) {
+                val frame = retriever.getFrameAtTime(
+                    sec * 1_000_000L,
+                    MediaMetadataRetriever.OPTION_CLOSEST_SYNC
+                )
+                if (frame != null) {
+                    val tiny = Bitmap.createScaledBitmap(frame, 32, 18, false)
+                    frame.recycle()
+                    val pixels = IntArray(32 * 18)
+                    tiny.getPixels(pixels, 0, 32, 0, 0, 32, 18)
+                    tiny.recycle()
+                    val luma = IntArray(pixels.size) { idx ->
+                        val c = pixels[idx]
+                        (((c shr 16) and 0xFF) * 30 + ((c shr 8) and 0xFF) * 59 + (c and 0xFF) * 11) / 100
+                    }
+                    prevLuma?.let { prev ->
+                        var diffSum = 0L
+                        for (i in luma.indices) diffSum += abs(luma[i] - prev[i])
+                        val meanDiff = diffSum.toDouble() / (luma.size * 255.0)
+                        val fillEnd = min(totalSecs, sec + strideSec)
+                        for (k in sec until fillEnd) scores[k] = meanDiff
+                    }
+                    prevLuma = luma
+                }
+                sec += strideSec
+            }
+            scores
+        } catch (e: Exception) {
+            Log.w(TAG, "Scene activity scoring skipped: ${e.message}")
+            scores
+        } finally {
+            runCatching { retriever.release() }
+        }
+    }
+
+    /**
+     * Ports Silence Remover: computes 50ms RMS energy frames in dBFS and returns non-silent keep intervals.
+     */
+    suspend fun detectSpeechKeepIntervals(
+        context: Context,
+        uri: Uri,
+        noiseDb: Int = -35,
+        minSilenceSec: Double = 0.5,
+        padSec: Double = 0.12
+    ): SilenceAnalysisResult = withContext(Dispatchers.IO) {
+        val meta = getVideoMetadata(context, uri)
+        val dur = meta.durationSec
+        val frameMs = 50
+        val totalFrames = max(1, ((dur * 1000.0) / frameMs).roundToInt())
+        val rmsFrames = decodeBucketedRms(context, uri, bucketDurationMs = frameMs, maxBuckets = totalFrames)
+
+        if (rmsFrames.isEmpty()) {
+            return@withContext SilenceAnalysisResult(
+                originalDurationSec = dur,
+                newDurationSec = dur,
+                keepIntervals = listOf(TimeRangeSec(0.0, dur))
+            )
+        }
+
+        val frameSec = frameMs / 1000.0
+        val minSilentFrames = max(1, (minSilenceSec / frameSec).roundToInt())
+        val silentRuns = mutableListOf<TimeRangeSec>()
+
+        var runStartFrame = -1
+        for (i in rmsFrames.indices) {
+            val rms = rmsFrames[i]
+            val db = if (rms > 1e-7) 20.0 * log10(rms) else -120.0
+            if (db < noiseDb) {
+                if (runStartFrame < 0) runStartFrame = i
+            } else {
+                if (runStartFrame >= 0 && (i - runStartFrame) >= minSilentFrames) {
+                    silentRuns.add(TimeRangeSec(runStartFrame * frameSec, i * frameSec))
+                }
+                runStartFrame = -1
+            }
+        }
+        if (runStartFrame >= 0 && (rmsFrames.size - runStartFrame) >= minSilentFrames) {
+            silentRuns.add(TimeRangeSec(runStartFrame * frameSec, dur))
+        }
+
+        val keep = mutableListOf<TimeRangeSec>()
+        var pos = 0.0
+        for (silent in silentRuns) {
+            val st = max(0.0, silent.startSec)
+            val en = silent.endSec
+            if (st + padSec > pos + 0.08) {
+                keep.add(TimeRangeSec(pos, min(dur, st + padSec)))
+            }
+            pos = max(pos, en - padSec)
+        }
+        if (dur - pos > 0.08) {
+            keep.add(TimeRangeSec(pos, dur))
+        }
+
+        // Merge any adjacent or slightly overlapping keep windows
+        val merged = mutableListOf<TimeRangeSec>()
+        for (interval in keep) {
+            val last = merged.lastOrNull()
+            if (last != null && interval.startSec <= last.endSec + 0.05) {
+                merged[merged.lastIndex] = TimeRangeSec(last.startSec, max(last.endSec, interval.endSec))
+            } else if (interval.lengthSec >= 0.1) {
+                merged.add(interval)
+            }
+        }
+
+        val newDur = merged.sumOf { it.lengthSec }
+        SilenceAnalysisResult(
+            originalDurationSec = dur,
+            newDurationSec = newDur,
+            keepIntervals = merged
+        )
+    }
+
+    private fun decodeBucketedRms(
+        context: Context,
+        uri: Uri,
+        bucketDurationMs: Int,
+        maxBuckets: Int
+    ): DoubleArray {
         val extractor = MediaExtractor()
         var codec: MediaCodec? = null
-        try {
+        return try {
             extractor.setDataSource(context, uri, null)
             var audioTrackIndex = -1
             var audioFormat: MediaFormat? = null
@@ -106,14 +360,7 @@ object AudioPeakAnalyzer {
                     break
                 }
             }
-
-            if (audioTrackIndex == -1 || audioFormat == null) {
-                return@withContext AudioEnergyProfile(
-                    durationSec = meta.durationSec,
-                    secondEnergies = List(totalSecInt) { 0.25f },
-                    peakStartSec = 0.0
-                )
-            }
+            if (audioTrackIndex == -1 || audioFormat == null) return DoubleArray(0)
 
             extractor.selectTrack(audioTrackIndex)
             val mime = audioFormat.getString(MediaFormat.KEY_MIME)!!
@@ -126,8 +373,8 @@ object AudioPeakAnalyzer {
             codec.configure(audioFormat, null, null, 0)
             codec.start()
 
-            val bucketSquares = DoubleArray(totalSecInt)
-            val bucketCounts = LongArray(totalSecInt)
+            val bucketSquares = DoubleArray(maxBuckets)
+            val bucketCounts = LongArray(maxBuckets)
             val bufferInfo = MediaCodec.BufferInfo()
             var inputDone = false
             var outputDone = false
@@ -147,8 +394,7 @@ object AudioPeakAnalyzer {
                                 )
                                 inputDone = true
                             } else {
-                                val ptsUs = extractor.sampleTime
-                                codec.queueInputBuffer(inIdx, 0, sampleSize, ptsUs, 0)
+                                codec.queueInputBuffer(inIdx, 0, sampleSize, extractor.sampleTime, 0)
                                 extractor.advance()
                             }
                         }
@@ -159,15 +405,16 @@ object AudioPeakAnalyzer {
                 if (outIdx >= 0) {
                     val outBuf = codec.getOutputBuffer(outIdx)
                     if (outBuf != null && bufferInfo.size > 0) {
-                        val secIndex = ((bufferInfo.presentationTimeUs / 1_000_000L).toInt())
-                            .coerceIn(0, totalSecInt - 1)
+                        val startBucket = ((bufferInfo.presentationTimeUs / (bucketDurationMs * 1000L)).toInt())
+                            .coerceIn(0, maxBuckets - 1)
                         accumulatePcmEnergy(
                             buffer = outBuf,
                             offset = bufferInfo.offset,
                             sizeBytes = bufferInfo.size,
                             channels = channels,
                             sampleRate = sampleRate,
-                            startSecIndex = secIndex,
+                            bucketDurationMs = bucketDurationMs,
+                            startBucket = startBucket,
                             bucketSquares = bucketSquares,
                             bucketCounts = bucketCounts
                         )
@@ -179,41 +426,12 @@ object AudioPeakAnalyzer {
                 }
             }
 
-            val rawRms = DoubleArray(totalSecInt) { i ->
+            DoubleArray(maxBuckets) { i ->
                 if (bucketCounts[i] > 0) sqrt(bucketSquares[i] / bucketCounts[i]) else 0.0
             }
-            val maxRms = rawRms.maxOrNull()?.takeIf { it > 0.0 } ?: 1.0
-            val normalized = rawRms.map { (it / maxRms).toFloat().coerceIn(0f, 1f) }
-
-            var bestStart = 0
-            var bestMean = -1.0
-            val windowEndLimit = max(1, rawRms.size - clipDurationSec)
-            for (s in 0 until windowEndLimit) {
-                val end = min(rawRms.size, s + clipDurationSec)
-                var sum = 0.0
-                for (k in s until end) sum += rawRms[k]
-                val mean = sum / max(1, end - s)
-                if (mean > bestMean) {
-                    bestMean = mean
-                    bestStart = s
-                }
-            }
-
-            val peakStart = max(0.0, (bestStart - 5).toDouble())
-                .coerceAtMost(max(0.0, meta.durationSec - clipDurationSec))
-
-            AudioEnergyProfile(
-                durationSec = meta.durationSec,
-                secondEnergies = normalized,
-                peakStartSec = peakStart
-            )
         } catch (e: Exception) {
-            Log.e(TAG, "Audio RMS analysis failed, falling back to start=0", e)
-            AudioEnergyProfile(
-                durationSec = meta.durationSec,
-                secondEnergies = List(totalSecInt) { 0.35f },
-                peakStartSec = 0.0
-            )
+            Log.e(TAG, "Audio RMS decoding failed", e)
+            DoubleArray(0)
         } finally {
             runCatching { codec?.stop() }
             runCatching { codec?.release() }
@@ -227,15 +445,16 @@ object AudioPeakAnalyzer {
         sizeBytes: Int,
         channels: Int,
         sampleRate: Int,
-        startSecIndex: Int,
+        bucketDurationMs: Int,
+        startBucket: Int,
         bucketSquares: DoubleArray,
         bucketCounts: LongArray
     ) {
         val dup = buffer.duplicate()
         dup.position(offset)
         dup.limit(offset + sizeBytes)
-        val samplesTotal = sizeBytes / 2
         val stride = max(1, channels)
+        val samplesPerBucket = max(1, (sampleRate * bucketDurationMs) / 1000)
         var frameIdx = 0
         var i = 0
         while (i + 1 < sizeBytes) {
@@ -243,8 +462,8 @@ object AudioPeakAnalyzer {
             val hi = dup.get().toInt()
             val sample = ((hi shl 8) or lo).toShort().toDouble() / 32768.0
             if ((frameIdx % stride) == 0) {
-                val secOffset = if (sampleRate > 0) (frameIdx / stride) / sampleRate else 0
-                val idx = (startSecIndex + secOffset).coerceIn(0, bucketSquares.lastIndex)
+                val offsetBuckets = (frameIdx / stride) / samplesPerBucket
+                val idx = (startBucket + offsetBuckets).coerceIn(0, bucketSquares.lastIndex)
                 bucketSquares[idx] += sample * sample
                 bucketCounts[idx]++
             }
@@ -253,10 +472,6 @@ object AudioPeakAnalyzer {
         }
     }
 
-    /**
-     * Extracts ONLY the clip window's compressed audio track as an M4A byte array (~200-500 KB)
-     * so Gemini 3.8 Flash can transcribe exact timestamps without exceeding payload limits.
-     */
     suspend fun extractAudioClipBytes(
         context: Context,
         uri: Uri,

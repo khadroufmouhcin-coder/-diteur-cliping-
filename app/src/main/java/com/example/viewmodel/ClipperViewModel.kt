@@ -6,11 +6,14 @@ import android.net.Uri
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import android.provider.OpenableColumns
 import com.example.data.AiViralRepository
 import com.example.data.ApiSettingsRepository
 import com.example.data.AudioPeakAnalyzer
 import com.example.data.ClipStorageRepository
 import com.example.data.GeminiSettings
+import com.example.data.MontageSegmentSpec
+import com.example.data.StudioPipelines
 import com.example.data.VerticalVideoRenderer
 import com.example.data.YouTubeService
 import com.example.model.AudioEnergyProfile
@@ -21,7 +24,11 @@ import com.example.model.ClipPipelineState
 import com.example.model.HypeLevel
 import com.example.model.LiveChatMessage
 import com.example.model.LiveMomentCapture
+import com.example.model.MontageClipItem
 import com.example.model.SavedClip
+import com.example.model.SilenceAnalysisResult
+import com.example.model.StudioToolMode
+import com.example.model.TransitionType
 import com.example.model.YouTubeVideoInfo
 import com.example.model.ViralAnalysisResult
 import kotlinx.coroutines.CancellationException
@@ -100,6 +107,65 @@ data class LiveMonitorUiState(
     val capturedMoments: List<LiveMomentCapture> = emptyList()
 )
 
+data class MontageUiState(
+    val clips: List<MontageClipItem> = emptyList(),
+    val isLoadingClips: Boolean = false,
+    val segLenSec: Int = 5,
+    val autoBestMoment: Boolean = true,
+    val speed: Float = 1.0f,
+    val transition: TransitionType = TransitionType.FADE,
+    val verticalBlur: Boolean = true,
+    val enableCaptions: Boolean = false,
+    val captionStyle: CaptionStyle = CaptionStyle.VIRAL_YELLOW,
+    val enableHook: Boolean = false,
+    val hookText: String = "",
+    val musicUri: Uri? = null,
+    val musicTitle: String? = null,
+    val musicVolume: Float = 0.25f,
+    val lastPeakReason: String? = null,
+    val pipelineState: ClipPipelineState = ClipPipelineState.Idle
+)
+
+data class AiAutoMontageUiState(
+    val selectedVideoUri: Uri? = null,
+    val videoTitle: String = "",
+    val videoDurationSec: Double = 0.0,
+    val videoThumbnail: Bitmap? = null,
+    val youtubeUrlInput: String = "",
+    val isAnalyzingYoutubeUrl: Boolean = false,
+    val youtubeVideoInfo: YouTubeVideoInfo? = null,
+    val youtubeStatusMessage: String? = null,
+    val nClips: Int = 5,
+    val segLenSec: Int = 8,
+    val speed: Float = 1.0f,
+    val transition: TransitionType = TransitionType.FADE,
+    val verticalBlur: Boolean = true,
+    val enableCaptions: Boolean = true,
+    val captionStyle: CaptionStyle = CaptionStyle.KARAOKE,
+    val autoHook: Boolean = true,
+    val hookText: String = "",
+    val musicUri: Uri? = null,
+    val musicTitle: String? = null,
+    val musicVolume: Float = 0.25f,
+    val pickedHighlightsSec: List<Double> = emptyList(),
+    val lastPeakReason: String? = null,
+    val pipelineState: ClipPipelineState = ClipPipelineState.Idle
+)
+
+data class SilenceRemoverUiState(
+    val selectedVideoUri: Uri? = null,
+    val videoTitle: String = "",
+    val videoDurationSec: Double = 0.0,
+    val videoWidth: Int = 0,
+    val videoHeight: Int = 0,
+    val videoThumbnail: Bitmap? = null,
+    val noiseDb: Int = -35,
+    val minSilenceSec: Float = 0.5f,
+    val isAnalyzing: Boolean = false,
+    val analysisResult: SilenceAnalysisResult? = null,
+    val pipelineState: ClipPipelineState = ClipPipelineState.Idle
+)
+
 data class VaultUiState(
     val clips: List<SavedClip> = emptyList(),
     val activePlayerClip: SavedClip? = null,
@@ -112,11 +178,23 @@ class ClipperViewModel(application: Application) : AndroidViewModel(application)
     private val youTubeService = YouTubeService()
     private val settingsRepository = ApiSettingsRepository(application)
 
+    private val _selectedToolMode = MutableStateFlow(StudioToolMode.VIRAL_CLIP)
+    val selectedToolMode: StateFlow<StudioToolMode> = _selectedToolMode.asStateFlow()
+
     private val _settingsState = MutableStateFlow(SettingsUiState())
     val settingsState: StateFlow<SettingsUiState> = _settingsState.asStateFlow()
 
     private val _studioState = MutableStateFlow(ClipStudioUiState())
     val studioState: StateFlow<ClipStudioUiState> = _studioState.asStateFlow()
+
+    private val _montageState = MutableStateFlow(MontageUiState())
+    val montageState: StateFlow<MontageUiState> = _montageState.asStateFlow()
+
+    private val _aiMontageState = MutableStateFlow(AiAutoMontageUiState())
+    val aiMontageState: StateFlow<AiAutoMontageUiState> = _aiMontageState.asStateFlow()
+
+    private val _silenceState = MutableStateFlow(SilenceRemoverUiState())
+    val silenceState: StateFlow<SilenceRemoverUiState> = _silenceState.asStateFlow()
 
     private val _liveState = MutableStateFlow(LiveMonitorUiState())
     val liveState: StateFlow<LiveMonitorUiState> = _liveState.asStateFlow()
@@ -126,6 +204,13 @@ class ClipperViewModel(application: Application) : AndroidViewModel(application)
 
     private var liveMonitorJob: Job? = null
     private var clipGenerationJob: Job? = null
+    private var montageJob: Job? = null
+    private var aiMontageJob: Job? = null
+    private var silenceJob: Job? = null
+
+    fun selectToolMode(mode: StudioToolMode) {
+        _selectedToolMode.value = mode
+    }
 
     init {
         refreshVault()
@@ -495,7 +580,8 @@ class ClipperViewModel(application: Application) : AndroidViewModel(application)
                             keyframes = keyframes,
                             videoTitle = state.videoTitle.ifBlank { "Viral Clip" },
                             durationSec = actualDuration,
-                            generateCaptions = state.enableCaptions
+                            generateCaptions = state.enableCaptions,
+                            karaokeMode = state.captionStyle == CaptionStyle.KARAOKE
                         )
                     } finally {
                         keyframes.forEach { if (!it.isRecycled) it.recycle() }
@@ -596,6 +682,584 @@ class ClipperViewModel(application: Application) : AndroidViewModel(application)
                 }
             }
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Multi-Clip Montage Actions
+    // -------------------------------------------------------------------------
+
+    fun onMontageVideosPicked(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        val context = getApplication<Application>()
+        viewModelScope.launch {
+            _montageState.update { it.copy(isLoadingClips = true, pipelineState = ClipPipelineState.Idle) }
+            try {
+                val segLen = _montageState.value.segLenSec
+                val added = uris.map { uri ->
+                    val meta = AudioPeakAnalyzer.getVideoMetadata(context, uri)
+                    val peak = if (meta.durationSec > segLen) {
+                        AudioPeakAnalyzer.analyzeAudioEnergy(context, uri, segLen).peakStartSec
+                    } else 0.0
+                    MontageClipItem(
+                        id = UUID.randomUUID().toString().take(8),
+                        uri = uri,
+                        displayName = meta.displayName.substringBeforeLast("."),
+                        durationSec = meta.durationSec,
+                        thumbnail = meta.thumbnail,
+                        peakStartSec = peak
+                    )
+                }
+                _montageState.update {
+                    it.copy(
+                        clips = it.clips + added,
+                        isLoadingClips = false
+                    )
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed adding montage videos", e)
+                _montageState.update {
+                    it.copy(
+                        isLoadingClips = false,
+                        pipelineState = ClipPipelineState.Error(e.localizedMessage ?: "Failed loading selected clips.")
+                    )
+                }
+            }
+        }
+    }
+
+    fun removeMontageClip(clipId: String) {
+        _montageState.update { s -> s.copy(clips = s.clips.filterNot { it.id == clipId }) }
+    }
+
+    fun moveMontageClip(clipId: String, delta: Int) {
+        _montageState.update { s ->
+            val list = s.clips.toMutableList()
+            val idx = list.indexOfFirst { it.id == clipId }
+            val target = idx + delta
+            if (idx >= 0 && target in list.indices) {
+                val item = list.removeAt(idx)
+                list.add(target, item)
+            }
+            s.copy(clips = list)
+        }
+    }
+
+    fun updateMontageSegLen(sec: Int) {
+        _montageState.update { it.copy(segLenSec = sec.coerceIn(3, 30)) }
+    }
+
+    fun toggleMontageAutoBest(enabled: Boolean) {
+        _montageState.update { it.copy(autoBestMoment = enabled) }
+    }
+
+    fun updateMontageSpeed(speed: Float) {
+        _montageState.update { it.copy(speed = speed.coerceIn(0.5f, 2.0f)) }
+    }
+
+    fun selectMontageTransition(transition: TransitionType) {
+        _montageState.update { it.copy(transition = transition) }
+    }
+
+    fun toggleMontageBlur(enabled: Boolean) {
+        _montageState.update { it.copy(verticalBlur = enabled) }
+    }
+
+    fun toggleMontageCaptions(enabled: Boolean) {
+        _montageState.update { it.copy(enableCaptions = enabled) }
+    }
+
+    fun selectMontageCaptionStyle(style: CaptionStyle) {
+        _montageState.update { it.copy(captionStyle = style) }
+    }
+
+    fun toggleMontageHook(enabled: Boolean) {
+        _montageState.update { it.copy(enableHook = enabled) }
+    }
+
+    fun updateMontageHookText(text: String) {
+        _montageState.update { it.copy(hookText = text) }
+    }
+
+    fun onMontageMusicPicked(uri: Uri) {
+        val title = resolveUriDisplayName(uri) ?: "Background Audio"
+        _montageState.update { it.copy(musicUri = uri, musicTitle = title) }
+    }
+
+    fun clearMontageMusic() {
+        _montageState.update { it.copy(musicUri = null, musicTitle = null) }
+    }
+
+    fun updateMontageMusicVol(vol: Float) {
+        _montageState.update { it.copy(musicVolume = vol.coerceIn(0f, 1f)) }
+    }
+
+    fun generateMontage() {
+        val state = _montageState.value
+        val settings = _settingsState.value
+        if (state.clips.isEmpty()) {
+            _montageState.update {
+                it.copy(pipelineState = ClipPipelineState.Error("Add at least 1 video clip to build a montage."))
+            }
+            return
+        }
+        if (state.enableCaptions && !settings.hasApiKey) {
+            _montageState.update {
+                it.copy(
+                    pipelineState = ClipPipelineState.Error(
+                        "Gemini API key is required for AI Auto-Captions. Enter your key in Settings or disable captions."
+                    )
+                )
+            }
+            return
+        }
+
+        montageJob?.cancel()
+        montageJob = viewModelScope.launch {
+            val context = getApplication<Application>()
+            try {
+                _montageState.update {
+                    it.copy(pipelineState = ClipPipelineState.AnalyzingAudio("Inspecting clip audio peaks..."))
+                }
+                val specs = state.clips.map { clip ->
+                    val len = min(state.segLenSec.toDouble(), max(0.5, clip.durationSec))
+                    val start = if (state.autoBestMoment && clip.durationSec > len) {
+                        clip.peakStartSec.coerceIn(0.0, max(0.0, clip.durationSec - len))
+                    } else 0.0
+                    MontageSegmentSpec(
+                        uri = clip.uri,
+                        startSec = start,
+                        lengthSec = len,
+                        hasAudio = AudioPeakAnalyzer.hasAudioTrack(context, clip.uri)
+                    )
+                }
+
+                val title = if (state.clips.size == 1) state.clips.first().displayName
+                else "Montage (${state.clips.size} clips)"
+
+                val (saved, aiResult) = StudioPipelines.runMontageRenderPipeline(
+                    context = context,
+                    segments = specs,
+                    title = title,
+                    speed = state.speed,
+                    transition = state.transition,
+                    verticalBlur = state.verticalBlur,
+                    enableCaptions = state.enableCaptions,
+                    captionStyle = state.captionStyle,
+                    enableHook = state.enableHook,
+                    hookText = state.hookText,
+                    hookDurationSec = null,
+                    musicUri = state.musicUri,
+                    musicVolume = state.musicVolume,
+                    apiKey = settings.apiKey,
+                    modelName = settings.modelName,
+                    aiRepository = aiRepository,
+                    onStatus = { status ->
+                        _montageState.update { it.copy(pipelineState = status) }
+                    }
+                )
+                refreshVault()
+                _montageState.update {
+                    it.copy(
+                        lastPeakReason = aiResult.peakReason,
+                        pipelineState = ClipPipelineState.Success(
+                            clip = saved,
+                            message = "Montage Ready! ${specs.size} clips • ${saved.durationSec}s"
+                        )
+                    )
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "Montage render failed", e)
+                _montageState.update {
+                    it.copy(pipelineState = ClipPipelineState.Error(e.localizedMessage ?: "Failed to render montage."))
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // AI Auto-Montage Actions (1 Long Video -> Highlight Mashup)
+    // -------------------------------------------------------------------------
+
+    fun onAiMontageVideoPicked(uri: Uri) {
+        val context = getApplication<Application>()
+        viewModelScope.launch {
+            _aiMontageState.update {
+                it.copy(
+                    selectedVideoUri = uri,
+                    pickedHighlightsSec = emptyList(),
+                    pipelineState = ClipPipelineState.Idle
+                )
+            }
+            try {
+                val meta = AudioPeakAnalyzer.getVideoMetadata(context, uri)
+                _aiMontageState.update {
+                    it.copy(
+                        videoTitle = meta.displayName.substringBeforeLast("."),
+                        videoDurationSec = meta.durationSec,
+                        videoThumbnail = meta.thumbnail
+                    )
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed reading video for AI Auto-Montage", e)
+                _aiMontageState.update {
+                    it.copy(pipelineState = ClipPipelineState.Error(e.localizedMessage ?: "Failed to read video."))
+                }
+            }
+        }
+    }
+
+    fun updateAiMontageYoutubeUrl(url: String) {
+        _aiMontageState.update { it.copy(youtubeUrlInput = url) }
+    }
+
+    fun analyzeAiMontageYoutubeUrl() {
+        val url = _aiMontageState.value.youtubeUrlInput.trim()
+        if (url.isEmpty()) {
+            _aiMontageState.update { it.copy(youtubeStatusMessage = "Enter a YouTube URL to inspect.") }
+            return
+        }
+        viewModelScope.launch {
+            _aiMontageState.update {
+                it.copy(isAnalyzingYoutubeUrl = true, youtubeStatusMessage = "Fetching YouTube info...")
+            }
+            try {
+                val info = youTubeService.fetchVideoInfo(url)
+                val settings = _settingsState.value
+                val hook = if (settings.hasApiKey) {
+                    runCatching {
+                        aiRepository.suggestViralHook(
+                            apiKey = settings.apiKey,
+                            modelName = settings.modelName,
+                            videoTitle = info.title,
+                            extraContext = "AI Auto-Montage Highlight Mashup"
+                        )
+                    }.getOrNull()
+                } else null
+                _aiMontageState.update {
+                    it.copy(
+                        isAnalyzingYoutubeUrl = false,
+                        youtubeVideoInfo = info,
+                        videoTitle = if (it.selectedVideoUri == null) info.title else it.videoTitle,
+                        hookText = hook ?: it.hookText,
+                        youtubeStatusMessage = "Loaded \"${info.title}\". Pick the downloaded video below to extract highlights."
+                    )
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _aiMontageState.update {
+                    it.copy(
+                        isAnalyzingYoutubeUrl = false,
+                        youtubeStatusMessage = e.localizedMessage ?: "Failed inspecting YouTube URL."
+                    )
+                }
+            }
+        }
+    }
+
+    fun updateAiMontageNClips(n: Int) {
+        _aiMontageState.update { it.copy(nClips = n.coerceIn(2, 10)) }
+    }
+
+    fun updateAiMontageSegLen(sec: Int) {
+        _aiMontageState.update { it.copy(segLenSec = sec.coerceIn(4, 20)) }
+    }
+
+    fun updateAiMontageSpeed(speed: Float) {
+        _aiMontageState.update { it.copy(speed = speed.coerceIn(0.5f, 2.0f)) }
+    }
+
+    fun selectAiMontageTransition(transition: TransitionType) {
+        _aiMontageState.update { it.copy(transition = transition) }
+    }
+
+    fun toggleAiMontageBlur(enabled: Boolean) {
+        _aiMontageState.update { it.copy(verticalBlur = enabled) }
+    }
+
+    fun toggleAiMontageCaptions(enabled: Boolean) {
+        _aiMontageState.update { it.copy(enableCaptions = enabled) }
+    }
+
+    fun selectAiMontageCaptionStyle(style: CaptionStyle) {
+        _aiMontageState.update { it.copy(captionStyle = style) }
+    }
+
+    fun toggleAiMontageAutoHook(enabled: Boolean) {
+        _aiMontageState.update { it.copy(autoHook = enabled) }
+    }
+
+    fun updateAiMontageHookText(text: String) {
+        _aiMontageState.update { it.copy(hookText = text) }
+    }
+
+    fun onAiMontageMusicPicked(uri: Uri) {
+        val title = resolveUriDisplayName(uri) ?: "Background Audio"
+        _aiMontageState.update { it.copy(musicUri = uri, musicTitle = title) }
+    }
+
+    fun clearAiMontageMusic() {
+        _aiMontageState.update { it.copy(musicUri = null, musicTitle = null) }
+    }
+
+    fun updateAiMontageMusicVol(vol: Float) {
+        _aiMontageState.update { it.copy(musicVolume = vol.coerceIn(0f, 1f)) }
+    }
+
+    fun generateAiAutoMontage() {
+        val state = _aiMontageState.value
+        val settings = _settingsState.value
+        val uri = state.selectedVideoUri
+        if (uri == null) {
+            _aiMontageState.update {
+                it.copy(pipelineState = ClipPipelineState.Error("Pick a long video from your device first."))
+            }
+            return
+        }
+        if (state.enableCaptions && !settings.hasApiKey) {
+            _aiMontageState.update {
+                it.copy(
+                    pipelineState = ClipPipelineState.Error(
+                        "Gemini API key is required for AI Auto-Captions. Enter your key in Settings or disable captions."
+                    )
+                )
+            }
+            return
+        }
+
+        aiMontageJob?.cancel()
+        aiMontageJob = viewModelScope.launch {
+            val context = getApplication<Application>()
+            try {
+                _aiMontageState.update {
+                    it.copy(
+                        pipelineState = ClipPipelineState.AnalyzingAudio(
+                            "Scoring 70% audio RMS + 30% scene action for top ${state.nClips} highlights..."
+                        )
+                    )
+                }
+
+                val starts = AudioPeakAnalyzer.analyzeHighlights(
+                    context = context,
+                    uri = uri,
+                    nClips = state.nClips,
+                    segLenSec = state.segLenSec
+                )
+                val hasAudio = AudioPeakAnalyzer.hasAudioTrack(context, uri)
+                val segLen = min(state.segLenSec.toDouble(), max(1.0, state.videoDurationSec))
+                val specs = starts.map { s ->
+                    MontageSegmentSpec(
+                        uri = uri,
+                        startSec = s,
+                        lengthSec = min(segLen, max(0.5, state.videoDurationSec - s)),
+                        hasAudio = hasAudio
+                    )
+                }
+
+                _aiMontageState.update { it.copy(pickedHighlightsSec = starts) }
+
+                val (saved, aiResult) = StudioPipelines.runMontageRenderPipeline(
+                    context = context,
+                    segments = specs,
+                    title = "${state.videoTitle.ifBlank { "Video" }} Mashup",
+                    speed = state.speed,
+                    transition = state.transition,
+                    verticalBlur = state.verticalBlur,
+                    enableCaptions = state.enableCaptions,
+                    captionStyle = state.captionStyle,
+                    enableHook = state.autoHook,
+                    hookText = state.hookText,
+                    hookDurationSec = 4.0,
+                    musicUri = state.musicUri,
+                    musicVolume = state.musicVolume,
+                    apiKey = settings.apiKey,
+                    modelName = settings.modelName,
+                    aiRepository = aiRepository,
+                    onStatus = { status ->
+                        _aiMontageState.update { it.copy(pipelineState = status) }
+                    }
+                )
+
+                refreshVault()
+                val spots = starts.joinToString(", ") { "${it.toInt()}s" }
+                _aiMontageState.update {
+                    it.copy(
+                        hookText = saved.hookText.ifBlank { it.hookText },
+                        lastPeakReason = "${aiResult.peakReason} • Highlights: $spots",
+                        pipelineState = ClipPipelineState.Success(
+                            clip = saved,
+                            message = "AI Auto-Montage Ready! ${starts.size} highlights (${saved.durationSec}s)"
+                        )
+                    )
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "AI Auto-Montage failed", e)
+                _aiMontageState.update {
+                    it.copy(pipelineState = ClipPipelineState.Error(e.localizedMessage ?: "AI Auto-Montage failed."))
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Silence Remover Actions
+    // -------------------------------------------------------------------------
+
+    fun onSilenceVideoPicked(uri: Uri) {
+        val context = getApplication<Application>()
+        viewModelScope.launch {
+            _silenceState.update {
+                it.copy(
+                    selectedVideoUri = uri,
+                    isAnalyzing = true,
+                    analysisResult = null,
+                    pipelineState = ClipPipelineState.Idle
+                )
+            }
+            try {
+                val meta = AudioPeakAnalyzer.getVideoMetadata(context, uri)
+                _silenceState.update {
+                    it.copy(
+                        videoTitle = meta.displayName.substringBeforeLast("."),
+                        videoDurationSec = meta.durationSec,
+                        videoWidth = meta.width,
+                        videoHeight = meta.height,
+                        videoThumbnail = meta.thumbnail
+                    )
+                }
+                val result = AudioPeakAnalyzer.detectSpeechKeepIntervals(
+                    context = context,
+                    uri = uri,
+                    noiseDb = _silenceState.value.noiseDb,
+                    minSilenceSec = _silenceState.value.minSilenceSec.toDouble()
+                )
+                _silenceState.update { it.copy(isAnalyzing = false, analysisResult = result) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "Silence scan failed", e)
+                _silenceState.update {
+                    it.copy(
+                        isAnalyzing = false,
+                        pipelineState = ClipPipelineState.Error(e.localizedMessage ?: "Failed scanning video audio.")
+                    )
+                }
+            }
+        }
+    }
+
+    fun updateSilenceNoiseDb(db: Int) {
+        _silenceState.update { it.copy(noiseDb = db.coerceIn(-60, -20)) }
+    }
+
+    fun updateSilenceMinSec(sec: Float) {
+        _silenceState.update { it.copy(minSilenceSec = sec.coerceIn(0.3f, 2.0f)) }
+    }
+
+    fun analyzeSilencePreview() {
+        val state = _silenceState.value
+        val uri = state.selectedVideoUri ?: return
+        viewModelScope.launch {
+            _silenceState.update { it.copy(isAnalyzing = true, pipelineState = ClipPipelineState.Idle) }
+            try {
+                val result = AudioPeakAnalyzer.detectSpeechKeepIntervals(
+                    context = getApplication(),
+                    uri = uri,
+                    noiseDb = state.noiseDb,
+                    minSilenceSec = state.minSilenceSec.toDouble()
+                )
+                _silenceState.update { it.copy(isAnalyzing = false, analysisResult = result) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _silenceState.update {
+                    it.copy(
+                        isAnalyzing = false,
+                        pipelineState = ClipPipelineState.Error(e.localizedMessage ?: "Silence scan failed.")
+                    )
+                }
+            }
+        }
+    }
+
+    fun removeSilence() {
+        val state = _silenceState.value
+        val uri = state.selectedVideoUri
+        if (uri == null) {
+            _silenceState.update {
+                it.copy(pipelineState = ClipPipelineState.Error("Pick a video from your device first."))
+            }
+            return
+        }
+
+        silenceJob?.cancel()
+        silenceJob = viewModelScope.launch {
+            val context = getApplication<Application>()
+            try {
+                _silenceState.update {
+                    it.copy(pipelineState = ClipPipelineState.AnalyzingAudio("Detecting silence below ${state.noiseDb} dBFS..."))
+                }
+                val analysis = AudioPeakAnalyzer.detectSpeechKeepIntervals(
+                    context = context,
+                    uri = uri,
+                    noiseDb = state.noiseDb,
+                    minSilenceSec = state.minSilenceSec.toDouble()
+                )
+                _silenceState.update { it.copy(analysisResult = analysis) }
+
+                val saved = StudioPipelines.runSilenceCutPipeline(
+                    context = context,
+                    inputUri = uri,
+                    title = state.videoTitle.ifBlank { "Video" },
+                    keepIntervals = analysis.keepIntervals,
+                    originalDurationSec = analysis.originalDurationSec,
+                    newDurationSec = analysis.newDurationSec,
+                    onStatus = { status ->
+                        _silenceState.update { it.copy(pipelineState = status) }
+                    }
+                )
+                refreshVault()
+                val savedPct = if (analysis.originalDurationSec > 0.0) {
+                    (((analysis.originalDurationSec - analysis.newDurationSec) / analysis.originalDurationSec) * 100.0).toInt()
+                } else 0
+                _silenceState.update {
+                    it.copy(
+                        pipelineState = ClipPipelineState.Success(
+                            clip = saved,
+                            message = "Silence Removed! ${analysis.originalDurationSec.toInt()}s → ${analysis.newDurationSec.toInt()}s (-$savedPct%)"
+                        )
+                    )
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "Silence removal failed", e)
+                _silenceState.update {
+                    it.copy(pipelineState = ClipPipelineState.Error(e.localizedMessage ?: "Failed removing silence."))
+                }
+            }
+        }
+    }
+
+    private fun resolveUriDisplayName(uri: Uri): String? {
+        val context = getApplication<Application>()
+        return runCatching {
+            context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                ?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                        if (idx >= 0) cursor.getString(idx) else null
+                    } else null
+                }
+        }.getOrNull()
     }
 
     // -------------------------------------------------------------------------
@@ -913,5 +1577,8 @@ class ClipperViewModel(application: Application) : AndroidViewModel(application)
         super.onCleared()
         liveMonitorJob?.cancel()
         clipGenerationJob?.cancel()
+        montageJob?.cancel()
+        aiMontageJob?.cancel()
+        silenceJob?.cancel()
     }
 }
